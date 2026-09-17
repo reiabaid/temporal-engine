@@ -61,7 +61,9 @@ TemporalEvent {
 }
 ```
 
-`EventType` values (Phase 1 set): `TASK_STARTED`, `TASK_WINDOW_ENDED`, `TASK_DEADLINE_BREACHED`, `TASK_COMPLETED`, `NEW_DAY`, `ACTION_PROPOSED` (see §4).
+`EventType` values (Phase 1 set): `TASK_CREATED`, `TASK_STARTED`, `TASK_WINDOW_ENDED`, `TASK_DEADLINE_BREACHED`, `TASK_COMPLETED`, `NEW_DAY`, `ACTION_PROPOSED` (see §4).
+
+`TASK_CREATED` was added during the storage-layer build (not in the original v0.1 draft): replay needs to reconstruct a task from nothing but its event log, and a log of only status *changes* has no event describing the task's original fields (title, times, timezone). `TASK_CREATED`'s payload carries a full snapshot of those fields at creation time.
 
 The `occurred_at` / `recorded_at` split (bitemporal: valid time vs. transaction time) is what makes "what happened while I was away" and "what did we know at 4pm yesterday" both answerable from the same log, without special-casing either query.
 
