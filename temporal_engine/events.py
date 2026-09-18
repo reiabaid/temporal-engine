@@ -20,6 +20,12 @@ class EventType(str, Enum):
     TASK_COMPLETED = "TASK_COMPLETED"
     NEW_DAY = "NEW_DAY"
     ACTION_PROPOSED = "ACTION_PROPOSED"
+    # Added in Phase 2, once mutators exist to produce them --
+    # SPEC.md originally only covered engine-driven (tick()) transitions.
+    TASK_RESCHEDULED = "TASK_RESCHEDULED"
+    TASK_CARRIED_FORWARD = "TASK_CARRIED_FORWARD"
+    TASK_DROPPED = "TASK_DROPPED"
+    TASK_CANCELLED = "TASK_CANCELLED"
 
 
 SCHEMA_VERSION = 1

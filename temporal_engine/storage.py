@@ -107,6 +107,7 @@ def _apply(tasks: dict[str, Task], event: TemporalEvent) -> None:
             deadline=_parse_dt(p.get("deadline")),
             status=TaskStatus(p["status"]),
             recurrence=p.get("recurrence"),
+            carried_from=p.get("carried_from"),
         )
         return
 
@@ -126,6 +127,14 @@ def _apply(tasks: dict[str, Task], event: TemporalEvent) -> None:
             TaskStatus.COMPLETED_LATE if late else TaskStatus.COMPLETED,
             at=event.occurred_at,
         )
+    elif event.event_type == EventType.TASK_RESCHEDULED:
+        task.apply_transition(TaskStatus.RESCHEDULED, at=event.occurred_at)
+    elif event.event_type == EventType.TASK_CARRIED_FORWARD:
+        task.apply_transition(TaskStatus.CARRIED_FORWARD, at=event.occurred_at)
+    elif event.event_type == EventType.TASK_DROPPED:
+        task.apply_transition(TaskStatus.DROPPED, at=event.occurred_at)
+    elif event.event_type == EventType.TASK_CANCELLED:
+        task.apply_transition(TaskStatus.CANCELLED, at=event.occurred_at)
 
 
 def _parse_dt(value: Optional[str]) -> Optional[datetime]:
@@ -150,5 +159,6 @@ def task_created_event(task: Task, at: datetime) -> TemporalEvent:
             "deadline": task.deadline.isoformat() if task.deadline else None,
             "status": task.status.value,
             "recurrence": task.recurrence,
+            "carried_from": task.carried_from,
         },
     )
