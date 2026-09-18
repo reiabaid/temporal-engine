@@ -111,6 +111,7 @@ This exists even for rejected proposals — it's the record used to debug a bad 
 
 ### STABLE
 
+- `create_task(title, timezone, scheduled_start?, scheduled_end?, deadline?)` — missing from the original v0.1 draft entirely (the primitive list covered reading state and mutating an *existing* task, but never creating one — found only once Phase 3's MCP server needed a real tool an agent could call for "plan my day").
 - `get_temporal_context()` — returns current time, all non-terminal tasks, and events since the caller's last-seen checkpoint. This subsumes what might otherwise be separate `get_upcoming_events`/`get_overdue_events` calls — one call for "everything relevant right now."
 - `complete_task(task_id, idempotency_key)`
 - `reschedule_task(task_id, new_start, new_end, idempotency_key)`
@@ -146,7 +147,11 @@ Each mutator is a thin wrapper that calls the state-machine validator (§1) befo
 
 Carried forward explicitly rather than resolved by assumption:
 
-1. `ask_user` transport (§5) — resolve in Phase 3.
-2. Action schema shape (§3) — expect revision in Phase 4.
-3. Push notification support (§6) — resolve in Phase 3, client-by-client.
+1. `ask_user` transport (§5) — **still open.** No `ask_user` tool exists in `mcp_server.py` yet; the six other primitives (including the new `create_task`) were built and verified first. Needs a decision before it's implemented, not after.
+2. Action schema shape (§3) — expect revision in Phase 4, once a second LLM provider's native tool-calling shape is tested against it.
+3. Push notification support (§6) — **partially resolved.** Pull-via-`get_temporal_context` is now STABLE and verified for real: a scripted MCP `ClientSession` over stdio created a task, and the scheduler loop (running in the same process, per the Phase 1 architecture decision) correctly woke early and ticked it through `ACTIVE` → `WINDOW_ENDED` in real time — proving the wake-event mechanism, not just the pull-query. What's *not* yet verified: whether an actual interactive client (Claude Desktop or Claude Code, not a scripted session) does anything useful with a server-initiated push, since none was attempted. That verification needs a human at the actual app, not something a script can stand in for.
 4. Recurrence × DST collision (§7) — deferred to Phase 5.
+
+## Bug found and fixed during Phase 3's real-client test
+
+The scheduler loop originally computed its sleep duration once per iteration (`asyncio.sleep(delay)`). A task created with a near-term boundary while the loop was already asleep toward a distant target (e.g. tonight's midnight, computed against an empty task list at startup) would not be ticked until that stale target arrived — a real violation of "event-driven, no stale waits" that only surfaced by actually running the server and creating a task against it, not from reading the code. Fixed with a `wake_event` (`asyncio.Event`) that every task-mutating tool sets, and the scheduler now `asyncio.wait_for`s on it with the computed delay as a timeout — woken early, it recomputes; timed out naturally, it ticks. Verified live: a task scheduled 3 seconds out, created while the loop was asleep toward midnight, correctly transitioned `SCHEDULED` → `ACTIVE` → `WINDOW_ENDED` within the expected few seconds.
