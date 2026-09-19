@@ -77,3 +77,31 @@ def test_apply_action_reschedule_produces_decision_plus_mutator_events():
         "ACTION_PROPOSED", "TASK_RESCHEDULED", "TASK_CREATED",
     ]
     assert events[0].payload["action_call"]["reason"] == "slack available before the next task"
+
+
+def test_naive_datetime_from_a_model_is_rejected_with_a_readable_reason_not_a_crash():
+    t = Task.new("DSA", "UTC", scheduled_start=datetime(2026, 1, 1, 14, tzinfo=UTC))
+    tasks = {t.id: t}
+    naive = datetime(2026, 1, 1, 16, 0)  # no tzinfo
+    call = ActionCall(
+        idempotency_key="k", action="reschedule_task", task_id=t.id,
+        args={"new_start": naive, "new_end": naive + timedelta(hours=1)},
+    )
+
+    events = apply_action(tasks, call, now=datetime(2026, 1, 1, 16, tzinfo=UTC), seen_idempotency_keys=set())
+
+    assert events[0].payload["outcome"] == "rejected"
+    assert "UTC offset" in events[0].payload["rejection_reason"]
+    assert t.status == TaskStatus.SCHEDULED  # untouched
+
+
+def test_missing_or_unparseable_times_are_rejected_not_raised():
+    t = Task.new("DSA", "UTC", scheduled_start=datetime(2026, 1, 1, 14, tzinfo=UTC))
+    tasks = {t.id: t}
+    now = datetime(2026, 1, 1, 16, tzinfo=UTC)
+
+    for args in ({}, {"new_start": "sometime soon", "new_end": now + timedelta(hours=1)}):
+        call = ActionCall(idempotency_key=str(args), action="reschedule_task", task_id=t.id, args=args)
+        events = apply_action(tasks, call, now, seen_idempotency_keys=set())
+        assert events[0].payload["outcome"] == "rejected"
+        assert "ISO 8601" in events[0].payload["rejection_reason"]

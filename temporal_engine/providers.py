@@ -52,9 +52,17 @@ class StubHeuristicLLM:
 
     def decide(self, ctx: TemporalContext) -> list[ActionCall]:
         actions: list[ActionCall] = []
+        tasks_by_id = {t.id: t for t in ctx.tasks}
         for event in ctx.events:
-            if event.event_type == EventType.TASK_WINDOW_ENDED:
-                actions.append(self._handle_window_ended(ctx, event))
+            if event.event_type != EventType.TASK_WINDOW_ENDED:
+                continue
+            # Events can be stale by the time we look at them: the user may
+            # have completed the task since the window ended. Acting on a
+            # finished task would just be a rejected proposal.
+            task = tasks_by_id.get(event.task_id)
+            if task is None or task.is_terminal():
+                continue
+            actions.append(self._handle_window_ended(ctx, event))
         return actions
 
     def _handle_window_ended(self, ctx: TemporalContext, event: TemporalEvent) -> ActionCall:

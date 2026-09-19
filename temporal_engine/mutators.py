@@ -67,6 +67,16 @@ def _relocate(
     only in the target status and event type."""
     task = tasks[task_id]
 
+    # Times may originate from an LLM, i.e. untrusted input. A naive
+    # datetime (no UTC offset) compared against our aware ones raises
+    # TypeError deep inside the engine, which apply_action would not
+    # treat as a rejection -- so reject it here with a readable reason.
+    for name, value in (("new_start", new_start), ("new_end", new_end)):
+        if not isinstance(value, datetime):
+            raise ValueError(f"{name} must be an ISO 8601 datetime, got {value!r}")
+        if value.tzinfo is None:
+            raise ValueError(f"{name} must include a UTC offset, got {value.isoformat()}")
+
     if new_end <= new_start:
         raise ValueError(f"new_end ({new_end}) must be after new_start ({new_start})")
 

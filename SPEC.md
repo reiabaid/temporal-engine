@@ -90,6 +90,19 @@ Marked DRAFT because a second LLM provider's native tool-calling shape (Phase 4)
 
 `idempotency_key` is required, not optional: if an action is applied to the event log but the acknowledgment is lost before the caller sees it, a retried call with the same key must be a no-op rather than a double-apply.
 
+### Revisions from writing the second provider (Phase 4)
+
+Found by implementing an OpenAI provider next to the Anthropic one. **Evidence level: written against each vendor's documented response shape and tested with fake clients shaped like them; no live call to either vendor has been made.** These are design findings, not benchmark results.
+
+- **Model output is untrusted and the schema must say so.** Tool-call arguments can be malformed (OpenAI delivers them as a JSON *string*, which can be truncated), datetimes can lack a UTC offset, and fields can be missing. The contract is now: parsing never raises. Anything unusable becomes an `ActionCall` with `action: "unparseable_tool_call"`, which the deterministic layer rejects and the decision log records. Times reaching a mutator are validated there (must be a `datetime`, must carry a UTC offset), so a bad model output is a logged rejection with a readable reason rather than a `TypeError` deep in the engine.
+- **`idempotency_key` comes from the vendor's tool-call id** (`toolu_…`, `call_…`). This protects re-*applying* a call whose acknowledgment was lost. It does **not** protect against re-*deciding*: asking a model again after a crash yields new ids and possibly a different decision. If that matters, the key must be derived from the triggering events rather than from the model's output. Not needed yet; flagged so it isn't assumed.
+- **Vendor differences are confined to wire format** (tool wrapping, `input_schema` vs `parameters`, system prompt as argument vs message, `tool_calls` being `None` vs empty, arguments as dict vs JSON string). Prompt, tool schema and output parsing are shared in `provider_common.py`; each vendor module is ~50 lines. `base_url` lets the OpenAI provider drive local servers (e.g. Ollama) with no third class.
+- **The action schema itself did not need to change.** The DRAFT label stays until a live model has been run against the scenarios.
+
+### Decision fixtures (`temporal_engine/scenarios.py`)
+
+Each scenario encodes its correct decision as an assertion: an allowed-action set (empty = "correct answer is to do nothing"), enforced through the real deterministic layer (a proposal must be *applied*, not merely well-formed), plus a per-scenario constraint. Restraint counts as correct. The same fixtures score the stub in CI (`tests/test_scenarios.py`, which also proves the scoring discriminates by running deliberately wrong providers) and any live model by hand (`scripts/live_scenarios.py`, multiple runs per scenario). Four scenarios exist today; the plan's fuller list (deadlines, recurrence, dependencies, multi-day) is Phase 6 work.
+
 ---
 
 ## 4. Decision log — STABLE

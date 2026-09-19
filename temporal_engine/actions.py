@@ -66,13 +66,13 @@ def _dispatch(tasks: dict[str, Task], call: ActionCall, now: datetime) -> list[T
 
     elif call.action == "reschedule_task":
         _, events = reschedule_task(
-            tasks, call.task_id, call.args["new_start"], call.args["new_end"], now,
+            tasks, call.task_id, call.args.get("new_start"), call.args.get("new_end"), now,
         )
         return events
 
     elif call.action == "carry_forward_task":
         _, events = carry_forward_task(
-            tasks, call.task_id, call.args["new_start"], call.args["new_end"], now,
+            tasks, call.task_id, call.args.get("new_start"), call.args.get("new_end"), now,
         )
         return events
 
