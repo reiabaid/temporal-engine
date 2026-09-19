@@ -1,5 +1,14 @@
 # Temporal Context Protocol — Build Plan (v0.2)
 
+> **Status (read this first; everything below is the original plan, kept as a record).**
+> Phases 0-4 are built and tested; see `SPEC.md` (v0.2) for what the system actually does and, at its end, what is *not* done. Where this plan and `SPEC.md` disagree, `SPEC.md` is right. Known departures from the plan below:
+> - **`ask_user` was dropped**, replaced by a confirmation hold (`requires_confirmation` + `confirm_action`/`reject_action`).
+> - **The "single process, no daemon" decision was extended**: every process runs the same loop and any of them can become the scheduler, because a lock tried once at startup left nobody ticking when the holder exited.
+> - **The real work surfaced after Phase 4.** An audit of the running system found the two-clients-one-database case could corrupt the log; fixing it changed the architecture (writes validated against the log under a write lock). The plan's "optimistic concurrency in Phase 5" was too late and too weak.
+> - **Not started:** Phase 5 recurrence (nothing uses the `recurrence` field), Phase 6 benchmark beyond four fixtures, Phase 7 release. No live LLM has been run; Claude Desktop was never tested.
+> - The plan's Phase 3 question of events reaching a human without polling was answered negatively: nothing observed suggests push works, so pull is the only reliable channel.
+
+
 Status legend: **STABLE** = build against this; **DRAFT** = expect it to change after Phase 3/4; **DEFERRED** = named but not built yet.
 
 ---

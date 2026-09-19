@@ -105,3 +105,64 @@ def test_missing_or_unparseable_times_are_rejected_not_raised():
         events = apply_action(tasks, call, now, seen_idempotency_keys=set())
         assert events[0].payload["outcome"] == "rejected"
         assert "ISO 8601" in events[0].payload["rejection_reason"]
+
+
+# ---- idempotency semantics, holds, and the create action ----
+
+def test_only_applied_keys_are_remembered_so_a_transient_rejection_is_retryable():
+    t = Task.new("DSA", "UTC", scheduled_start=datetime(2026, 1, 1, 14, tzinfo=UTC))
+    tasks, seen = {t.id: t}, set()
+    now = datetime(2026, 1, 1, 15, tzinfo=UTC)
+
+    first = apply_action(tasks, ActionCall("k", "start_task", "no-such-task"), now, seen)
+    assert first[0].payload["outcome"] == "rejected" and seen == set()
+
+    retry = apply_action(tasks, ActionCall("k", "start_task", t.id), now, seen)
+    assert retry[0].payload["outcome"] == "applied" and seen == {"k"}
+
+
+def test_an_unknown_task_id_is_rejected_with_a_readable_reason():
+    events = apply_action({}, ActionCall("k", "complete_task", "ghost"), datetime(2026, 1, 1, tzinfo=UTC), set())
+    assert events[0].payload["outcome"] == "rejected"
+    assert "unknown task_id 'ghost'" in events[0].payload["rejection_reason"]
+
+
+def test_requires_confirmation_holds_the_action_without_applying_it_or_remembering_its_key():
+    t = Task.new("DSA", "UTC", scheduled_start=datetime(2026, 1, 1, 14, tzinfo=UTC))
+    tasks, seen = {t.id: t}, set()
+    call = ActionCall("k", "cancel_task", t.id, {"mode": "drop"}, requires_confirmation=True)
+    now = datetime(2026, 1, 1, 15, tzinfo=UTC)
+
+    held = apply_action(tasks, call, now, seen)
+    assert [e.payload["outcome"] for e in held] == ["pending_confirmation"]
+    assert t.status == TaskStatus.SCHEDULED and seen == set()
+
+    confirmed = apply_action(tasks, call, now, seen, confirmed=True)
+    assert confirmed[0].payload["outcome"] == "applied"
+    assert t.status == TaskStatus.DROPPED
+
+
+def test_create_task_action_validates_and_returns_the_new_task_event():
+    tasks = {}
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    good = apply_action(tasks, ActionCall("k1", "create_task", None, {
+        "title": "DSA", "display_timezone": "UTC",
+        "scheduled_start": now + timedelta(hours=1), "scheduled_end": now + timedelta(hours=2),
+    }), now, set())
+    assert [e.event_type.value for e in good] == ["ACTION_PROPOSED", "TASK_CREATED"]
+    assert good[1].payload["idempotency_key"] == "k1"      # lets a retried create find the original
+
+    bad = apply_action(tasks, ActionCall("k2", "create_task", None, {
+        "title": "x", "display_timezone": "UTC", "scheduled_start": datetime(2026, 1, 1, 9),   # naive
+    }), now, set())
+    assert bad[0].payload["outcome"] == "rejected" and len(tasks) == 1
+
+
+def test_a_logged_call_round_trips_back_into_a_live_one():
+    from temporal_engine.actions import action_call_from_payload
+    original = ActionCall("k", "reschedule_task", "t1", {
+        "new_start": datetime(2026, 1, 1, 9, tzinfo=UTC), "new_end": datetime(2026, 1, 1, 10, tzinfo=UTC),
+    }, reason="gap", requires_confirmation=True)
+    logged = apply_action({}, original, datetime(2026, 1, 1, tzinfo=UTC), set())[0].payload["action_call"]
+    rebuilt = action_call_from_payload(logged)
+    assert rebuilt == original

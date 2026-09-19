@@ -1,261 +1,327 @@
 """
-MCP server exposing the temporal engine, per SPEC.md section 5's
-primitive surface.
+MCP server exposing the temporal engine (SPEC.md section 5).
 
-Architecture note (see PLAN.md, Phase 1's "wake-up mechanism" decision):
-this is one long-running asyncio process that both answers MCP tool
-calls AND runs the scheduler loop, in the same event loop, via the
-lifespan background-task pattern. There is no separate daemon process
-for v1.
+All the engine logic lives in runtime.py; this file only translates between
+MCP tool calls and it.
 
-Per SPEC.md section 7's multi-writer lock: only one process may hold
-SchedulerLock against a given database at a time. If this process fails
-to acquire it (because another instance already holds it -- e.g. Claude
-Desktop and Claude Code both configured against the same DB file), it
-still answers every tool call, it just never runs tick() itself. That's
-the "read-only-for-scheduling, read/write-for-everything-else" role
-SPEC.md describes.
+Every tool is `async def` on purpose. The SDK runs a *sync* tool function on
+a worker thread, which would put tool code and the scheduler loop on
+different threads sharing one task dict and one SQLite connection. Async
+tools run on the event-loop thread with the scheduler, so there is exactly
+one thread touching engine state and no locking to get wrong. The database
+calls inside are short and blocking, which is fine for a local single-user
+tool; moving them to an executor would reintroduce the threads.
+
+Logging goes to stderr only: stdout is the MCP protocol channel.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
-import sqlite3
+import sys
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
-from typing import Optional
-from zoneinfo import ZoneInfo
+from typing import Any, Optional
 
 from mcp.server.mcpserver import Context, MCPServer
 
-from temporal_engine.actions import ActionCall, apply_action
-from temporal_engine.engine import DayTracker, tick
-from temporal_engine.events import EventType
-from temporal_engine.lock import SchedulerLock, SchedulerLockHeld
-from temporal_engine.scheduler import RealClock, next_wake_time
-from temporal_engine.storage import all_events, append_event, init_db, replay, task_created_event
+from temporal_engine.actions import ActionCall, lenient_datetime
+from temporal_engine.events import EventType, TemporalEvent
+from temporal_engine.overlap import find_conflicts, find_overlapping
+from temporal_engine.runtime import Runtime
 from temporal_engine.task import Task
 
-DB_PATH = Path(os.environ.get("TEMPORAL_ENGINE_DB", "temporal_engine.db"))
-LOCK_PATH = DB_PATH.with_suffix(".lock")
+logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
+DB_PATH = os.environ.get("TEMPORAL_ENGINE_DB", "temporal_engine.db")
 DAY_BOUNDARY_TZ = os.environ.get("TEMPORAL_ENGINE_TZ", "UTC")
+REFRESH_SECONDS = float(os.environ.get("TEMPORAL_ENGINE_REFRESH_SECONDS", "5"))
 
-
-@dataclass
-class AppState:
-    conn: sqlite3.Connection
-    tasks: dict[str, Task]
-    clock: RealClock
-    seen_idempotency_keys: set = field(default_factory=set)
-    is_scheduler: bool = False
-    # Set by any tool that changes `tasks`, so a sleeping scheduler loop
-    # wakes up and recomputes next_wake_time immediately instead of
-    # sitting through a sleep duration that was computed before the
-    # change happened. Found by actually running the server end to end:
-    # without this, a task created with a near-term boundary while the
-    # loop was mid-sleep toward a distant one (e.g. tonight's midnight)
-    # would not be ticked until that stale target arrived.
-    wake_event: asyncio.Event = field(default_factory=asyncio.Event)
+MAX_FINISHED_TASKS = 50
 
 
 @asynccontextmanager
-async def lifespan(server: "MCPServer[AppState]") -> AsyncIterator[AppState]:
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    init_db(conn)
-
-    state = AppState(conn=conn, tasks=replay(conn), clock=RealClock(DAY_BOUNDARY_TZ))
-
-    lock = SchedulerLock(LOCK_PATH)
-    scheduler_task: Optional[asyncio.Task] = None
+async def lifespan(server: "MCPServer[Runtime]") -> AsyncIterator[Runtime]:
+    runtime = Runtime(DB_PATH, day_boundary_tz=DAY_BOUNDARY_TZ, refresh_interval=REFRESH_SECONDS)
+    loop_task = asyncio.create_task(runtime.run_forever())
     try:
-        lock.acquire()
-        state.is_scheduler = True
-        scheduler_task = asyncio.create_task(_scheduler_loop(state))
-    except SchedulerLockHeld:
-        # Another process already owns the scheduler for this DB. We
-        # still serve tool calls below -- we just never tick().
-        pass
-
-    try:
-        yield state
+        yield runtime
     finally:
-        if scheduler_task is not None:
-            scheduler_task.cancel()
-            try:
-                await scheduler_task
-            except asyncio.CancelledError:
-                pass
-            lock.release()
-        conn.close()
-
-
-def _last_recorded_local_date(state: AppState):
-    """The local date of the most recent thing this database recorded --
-    i.e. the last day the engine is known to have been aware of."""
-    events = all_events(state.conn)
-    if not events:
-        return None
-    return events[-1].recorded_at.astimezone(ZoneInfo(DAY_BOUNDARY_TZ)).date()
-
-
-async def _scheduler_loop(state: AppState) -> None:
-    """The event-driven core, unchanged in spirit from PLAN.md's Phase 1:
-    compute the next meaningful instant, sleep exactly until then, tick,
-    repeat. No fixed-interval polling anywhere."""
-    day_tracker = DayTracker(last_seen_date=_last_recorded_local_date(state))
-    while True:
-        # Cleared BEFORE ticking/computing, so a tool that sets it while
-        # we're mid-iteration isn't lost -- the wait below returns at once.
-        state.wake_event.clear()
-
-        # Tick first, sleep second. next_wake_time only looks at
-        # boundaries still in the future, so on startup after downtime
-        # (the host app was closed while a task's window elapsed) the
-        # overdue boundaries would be invisible to it and never ticked.
-        # tick() is idempotent and chains through every missed boundary,
-        # so ticking unconditionally at the top of each pass is safe.
-        for event in tick(state.tasks.values(), state.clock.now(), day_tracker,
-                          day_boundary_tz=DAY_BOUNDARY_TZ):
-            append_event(state.conn, event)
-
-        now = state.clock.now()
-        wake = next_wake_time(state.tasks.values(), now, day_boundary_tz=DAY_BOUNDARY_TZ)
+        loop_task.cancel()
         try:
-            await asyncio.wait_for(
-                state.wake_event.wait(), timeout=max((wake - now).total_seconds(), 0)
-            )
-            # Woken early because a tool changed `tasks`; loop back and
-            # recompute rather than trusting the now-stale target.
-        except asyncio.TimeoutError:
-            pass  # boundary reached naturally; loop back and tick
+            await loop_task
+        except asyncio.CancelledError:
+            pass
+        runtime.close()
 
 
 mcp = MCPServer("temporal-engine", lifespan=lifespan)
 
 
-def _task_summary(task: Task) -> dict:
-    return {
+# --------------------------------------------------------------- formatting
+
+def _iso(dt: Optional[datetime]) -> Optional[str]:
+    return dt.isoformat() if dt else None
+
+
+def _task_summary(task: Task, now: datetime) -> dict[str, Any]:
+    summary = {
         "id": task.id,
         "title": task.title,
         "status": task.status.value,
-        "scheduled_start": task.scheduled_start.isoformat() if task.scheduled_start else None,
-        "scheduled_end": task.scheduled_end.isoformat() if task.scheduled_end else None,
-        "deadline": task.deadline.isoformat() if task.deadline else None,
+        "scheduled_start": _iso(task.scheduled_start),
+        "scheduled_end": _iso(task.scheduled_end),
+        "deadline": _iso(task.deadline),
         "carried_from": task.carried_from,
+        "actual_start": _iso(task.actual_start),
     }
+    if task.actual_start is not None:
+        # Elapsed work is deterministic arithmetic, so the server does it
+        # rather than leaving it to the model.
+        end = task.last_transition_at if task.is_terminal() and task.last_transition_at else now
+        summary["worked_seconds"] = max(0, int((end - task.actual_start).total_seconds()))
+    return summary
 
 
-@mcp.tool()
-def get_temporal_context(ctx: Context) -> dict:
-    """Everything relevant right now: current time, every non-terminal
-    task, and the most recent events. Per SPEC.md section 6, this
-    pull-based call is how an agent answers "what happened while I was
-    away" -- it works regardless of whether this MCP client supports
-    push notifications (most don't, as of this writing)."""
-    state: AppState = ctx.request_context.lifespan_context
-    recent = all_events(state.conn)[-20:]
+def _event_summary(event: TemporalEvent) -> dict[str, Any]:
     return {
-        "now": state.clock.now().isoformat(),
-        "is_scheduler_process": state.is_scheduler,
-        "tasks": [_task_summary(t) for t in state.tasks.values() if not t.is_terminal()],
-        "recent_events": [
-            {"event_type": e.event_type.value, "task_id": e.task_id, "occurred_at": e.occurred_at.isoformat()}
-            for e in recent
-        ],
+        "seq": event.seq,
+        "event_type": event.event_type.value,
+        "task_id": event.task_id,
+        "occurred_at": event.occurred_at.isoformat(),
+        "recorded_at": event.recorded_at.isoformat(),
+        "detail": event.payload if event.event_type != EventType.TASK_CREATED else None,
     }
 
 
+def _result(runtime: Runtime, call: ActionCall, events: list[TemporalEvent]) -> dict[str, Any]:
+    """Shape an action's outcome for the caller. Includes the *new* task for
+    reschedule/carry_forward/create: those supersede or create rather than
+    mutate, and the caller needs the new id to act on the task again."""
+    view, now = runtime.store.view, runtime.clock.now()
+    decision = events[0]
+    created = [e.task_id for e in events if e.event_type == EventType.TASK_CREATED]
+    new_task_id = created[0] if created else None
+    if new_task_id is None and decision.payload["outcome"] == "superseded":
+        new_task_id = view.created_by_key.get(call.idempotency_key)  # a retried create
+
+    new_task = view.tasks.get(new_task_id) if new_task_id else None
+    task = view.tasks.get(call.task_id) if call.task_id else None
+
+    result: dict[str, Any] = {
+        "outcome": decision.payload["outcome"],
+        "rejection_reason": decision.payload.get("rejection_reason"),
+        "idempotency_key": call.idempotency_key,
+        "task": _task_summary(task, now) if task else None,
+        "new_task": _task_summary(new_task, now) if new_task else None,
+    }
+    if new_task is not None and new_task.scheduled_start and new_task.scheduled_end:
+        result["overlaps_with"] = [
+            {"id": t.id, "title": t.title, "scheduled_start": _iso(t.scheduled_start),
+             "scheduled_end": _iso(t.scheduled_end)}
+            for t in find_overlapping(
+                view.tasks.values(), new_task.scheduled_start, new_task.scheduled_end,
+                exclude_id=new_task.id,
+            )
+        ]
+    return result
+
+
+def _execute(runtime: Runtime, action: str, task_id: Optional[str], args: dict, reason: str,
+             idempotency_key: Optional[str]) -> dict[str, Any]:
+    call = ActionCall(
+        idempotency_key=idempotency_key or str(uuid.uuid4()),
+        action=action, task_id=task_id, args=args, reason=reason,
+    )
+    return _result(runtime, call, runtime.execute(call))
+
+
+# -------------------------------------------------------------------- reads
+
 @mcp.tool()
-def create_task(
+async def get_temporal_context(
+    ctx: Context,
+    since_seq: Optional[int] = None,
+    since: Optional[str] = None,
+    event_limit: int = 20,
+    include_finished: bool = False,
+) -> dict[str, Any]:
+    """Everything relevant right now: current time, unfinished tasks,
+    overlapping tasks, actions awaiting confirmation, scheduler health, and
+    recent events.
+
+    To learn what happened while away, pass the `cursor` from your previous
+    call as `since_seq` (or an ISO 8601 time as `since`): you get only newer
+    events, oldest first, with `events_truncated` set if there are more than
+    `event_limit`. Set include_finished to also list recently finished tasks
+    (completed, moved, dropped, cancelled) -- otherwise they are omitted."""
+    runtime: Runtime = ctx.request_context.lifespan_context
+    view = runtime.store.refresh()
+    now = runtime.clock.now()
+
+    since_time = lenient_datetime(since) if since else None
+    if since is not None and not isinstance(since_time, datetime):
+        raise ValueError(f"since must be an ISO 8601 datetime, got {since!r}")
+    events, truncated = runtime.store.events(
+        since_seq=since_seq, since_time=since_time, limit=max(1, min(event_limit, 200)),
+    )
+
+    active = [t for t in view.tasks.values() if not t.is_terminal()]
+    health = runtime.health
+    out: dict[str, Any] = {
+        "now": now.isoformat(),
+        "day_boundary_timezone": runtime.day_boundary_tz,
+        "is_scheduler_process": health.is_scheduler,
+        "scheduler": {
+            "last_pass_at": _iso(health.last_pass_at),
+            "last_tick_at": _iso(health.last_tick_at),
+            "last_error": health.last_error,
+            "consecutive_errors": health.consecutive_errors,
+        },
+        "quarantined_events": len(view.quarantined),
+        "tasks": [_task_summary(t, now) for t in active],
+        "conflicts": [
+            {"a": {"id": a.id, "title": a.title}, "b": {"id": b.id, "title": b.title}}
+            for a, b in find_conflicts(active)
+        ],
+        "pending_actions": [
+            {"idempotency_key": key, "action": c["action"], "task_id": c.get("task_id"),
+             "reason": c.get("reason", ""), "args": c.get("args", {})}
+            for key, c in view.pending.items()
+        ],
+        "events": [_event_summary(e) for e in events],
+        "events_truncated": truncated,
+        "cursor": view.last_seq,
+    }
+    if include_finished:
+        finished = sorted(
+            (t for t in view.tasks.values() if t.is_terminal()),
+            key=lambda t: t.last_transition_at or datetime.min.replace(tzinfo=now.tzinfo),
+            reverse=True,
+        )[:MAX_FINISHED_TASKS]
+        out["finished_tasks"] = [_task_summary(t, now) for t in finished]
+    return out
+
+
+@mcp.tool()
+async def list_pending_actions(ctx: Context) -> list[dict[str, Any]]:
+    """Actions held for a human's confirmation (e.g. cancelling a task).
+    Resolve each with confirm_action or reject_action."""
+    runtime: Runtime = ctx.request_context.lifespan_context
+    view = runtime.store.refresh()
+    return [
+        {"idempotency_key": key, "action": c["action"], "task_id": c.get("task_id"),
+         "reason": c.get("reason", ""), "args": c.get("args", {})}
+        for key, c in view.pending.items()
+    ]
+
+
+# ------------------------------------------------------------------ actions
+# Every mutating tool takes an optional idempotency_key. Supply the same key
+# when retrying a call whose response you did not receive: the second call is
+# recognised (durably -- across restarts and processes) and does nothing.
+
+@mcp.tool()
+async def create_task(
     ctx: Context,
     title: str,
     timezone: str,
     scheduled_start: Optional[str] = None,
     scheduled_end: Optional[str] = None,
     deadline: Optional[str] = None,
-) -> dict:
-    """Create a new task. Times are ISO 8601, e.g. '2026-09-12T14:00:00+05:30'."""
-    state: AppState = ctx.request_context.lifespan_context
-    task = Task.new(
-        title, timezone,
-        scheduled_start=datetime.fromisoformat(scheduled_start) if scheduled_start else None,
-        scheduled_end=datetime.fromisoformat(scheduled_end) if scheduled_end else None,
-        deadline=datetime.fromisoformat(deadline) if deadline else None,
-    )
-    state.tasks[task.id] = task
-    append_event(state.conn, task_created_event(task, at=state.clock.now()))
-    state.wake_event.set()  # a sleeping scheduler loop must recheck against this new task
-    return _task_summary(task)
-
-
-def _run_action(state: AppState, action: str, task_id: str, args: dict, reason: str) -> dict:
-    call = ActionCall(
-        idempotency_key=str(uuid.uuid4()),
-        action=action, task_id=task_id, args=args, reason=reason,
-    )
-    events = apply_action(state.tasks, call, state.clock.now(), state.seen_idempotency_keys)
-    for event in events:
-        append_event(state.conn, event)
-    state.wake_event.set()  # tasks may have changed shape (new task, new status)
-
-    decision = events[0]
-    # reschedule/carry_forward supersede the task with a brand-new one;
-    # the caller needs that new id to act on it again (e.g. to complete
-    # it), and would otherwise need a separate get_temporal_context call.
-    created = [e for e in events if e.event_type == EventType.TASK_CREATED]
-    new_task = state.tasks.get(created[0].task_id) if created else None
-    return {
-        "outcome": decision.payload["outcome"],
-        "rejection_reason": decision.payload.get("rejection_reason"),
-        "task": _task_summary(state.tasks[task_id]) if task_id in state.tasks else None,
-        "new_task": _task_summary(new_task) if new_task else None,
-    }
+    idempotency_key: Optional[str] = None,
+) -> dict[str, Any]:
+    """Create a task. Times are ISO 8601 WITH a UTC offset, e.g.
+    '2026-09-12T14:00:00+05:30'. `timezone` is an IANA name used for display.
+    A window needs both scheduled_start and scheduled_end (end after start);
+    a task may have only a deadline. The response lists any overlapping
+    tasks; overlaps are reported, not refused."""
+    runtime: Runtime = ctx.request_context.lifespan_context
+    return _execute(runtime, "create_task", None, {
+        "title": title, "display_timezone": timezone,
+        "scheduled_start": lenient_datetime(scheduled_start),
+        "scheduled_end": lenient_datetime(scheduled_end),
+        "deadline": lenient_datetime(deadline),
+    }, "", idempotency_key)
 
 
 @mcp.tool()
-def complete_task(ctx: Context, task_id: str) -> dict:
-    """Mark a task complete. Automatically recorded as late if the task's
-    window had already ended or its deadline had already passed."""
-    state: AppState = ctx.request_context.lifespan_context
-    return _run_action(state, "complete_task", task_id, {}, reason="")
+async def start_task(ctx: Context, task_id: str, idempotency_key: Optional[str] = None) -> dict[str, Any]:
+    """Record that work on a task actually began now. Enables the
+    `worked_seconds` figure in task summaries ("how long have I been on
+    this?"). Does not change the task's status."""
+    runtime: Runtime = ctx.request_context.lifespan_context
+    return _execute(runtime, "start_task", task_id, {}, "", idempotency_key)
 
 
 @mcp.tool()
-def reschedule_task(ctx: Context, task_id: str, new_start: str, new_end: str, reason: str) -> dict:
-    """Move a task to a new time. Capped at 3 moves per task lineage
-    (mutators.py) -- further attempts are rejected outright, never
-    silently looped."""
-    state: AppState = ctx.request_context.lifespan_context
-    return _run_action(
-        state, "reschedule_task", task_id,
-        {"new_start": datetime.fromisoformat(new_start), "new_end": datetime.fromisoformat(new_end)},
-        reason=reason,
-    )
+async def complete_task(ctx: Context, task_id: str, idempotency_key: Optional[str] = None) -> dict[str, Any]:
+    """Mark a task complete. Recorded as late if its window had already
+    ended or its deadline had already passed."""
+    runtime: Runtime = ctx.request_context.lifespan_context
+    return _execute(runtime, "complete_task", task_id, {}, "", idempotency_key)
 
 
 @mcp.tool()
-def carry_forward_task(ctx: Context, task_id: str, new_start: str, new_end: str, reason: str) -> dict:
-    """Move a task to a future day (typically tomorrow). Same lineage
-    cap as reschedule_task."""
-    state: AppState = ctx.request_context.lifespan_context
-    return _run_action(
-        state, "carry_forward_task", task_id,
-        {"new_start": datetime.fromisoformat(new_start), "new_end": datetime.fromisoformat(new_end)},
-        reason=reason,
-    )
+async def reschedule_task(
+    ctx: Context, task_id: str, new_start: str, new_end: str, reason: str,
+    new_deadline: Optional[str] = None, idempotency_key: Optional[str] = None,
+) -> dict[str, Any]:
+    """Move a task to a new time. It is superseded by a new task -- use the
+    returned `new_task.id` from then on. Rejected if the new start is not
+    before the task's deadline (pass new_deadline to extend it on purpose).
+    A task lineage can be moved at most 3 times per 24 hours; more is
+    rejected, never looped."""
+    runtime: Runtime = ctx.request_context.lifespan_context
+    args = {"new_start": lenient_datetime(new_start), "new_end": lenient_datetime(new_end)}
+    if new_deadline:
+        args["new_deadline"] = lenient_datetime(new_deadline)
+    return _execute(runtime, "reschedule_task", task_id, args, reason, idempotency_key)
 
 
 @mcp.tool()
-def cancel_task(ctx: Context, task_id: str, mode: str, reason: str) -> dict:
+async def carry_forward_task(
+    ctx: Context, task_id: str, new_start: str, new_end: str, reason: str,
+    new_deadline: Optional[str] = None, idempotency_key: Optional[str] = None,
+) -> dict[str, Any]:
+    """Move a task to a later day. Same rules, superseding and rate limit
+    as reschedule_task."""
+    runtime: Runtime = ctx.request_context.lifespan_context
+    args = {"new_start": lenient_datetime(new_start), "new_end": lenient_datetime(new_end)}
+    if new_deadline:
+        args["new_deadline"] = lenient_datetime(new_deadline)
+    return _execute(runtime, "carry_forward_task", task_id, args, reason, idempotency_key)
+
+
+@mcp.tool()
+async def cancel_task(
+    ctx: Context, task_id: str, mode: str, reason: str, idempotency_key: Optional[str] = None,
+) -> dict[str, Any]:
     """mode='drop' abandons the task without finishing it; mode='cancel'
-    removes it as no longer relevant (see SPEC.md section 1)."""
-    state: AppState = ctx.request_context.lifespan_context
-    return _run_action(state, "cancel_task", task_id, {"mode": mode}, reason=reason)
+    removes it as no longer relevant (SPEC.md section 1)."""
+    runtime: Runtime = ctx.request_context.lifespan_context
+    return _execute(runtime, "cancel_task", task_id, {"mode": mode}, reason, idempotency_key)
+
+
+@mcp.tool()
+async def confirm_action(ctx: Context, idempotency_key: str) -> dict[str, Any]:
+    """Approve an action that is awaiting confirmation (see
+    list_pending_actions) and apply it."""
+    runtime: Runtime = ctx.request_context.lifespan_context
+    events = runtime.confirm(idempotency_key)
+    call = ActionCall(idempotency_key=idempotency_key, action="", task_id=events[0].task_id)
+    return _result(runtime, call, events)
+
+
+@mcp.tool()
+async def reject_action(ctx: Context, idempotency_key: str) -> dict[str, Any]:
+    """Decline an action that is awaiting confirmation. Nothing is applied."""
+    runtime: Runtime = ctx.request_context.lifespan_context
+    events = runtime.decline(idempotency_key)
+    return {"outcome": events[0].payload["outcome"], "idempotency_key": idempotency_key}
 
 
 if __name__ == "__main__":

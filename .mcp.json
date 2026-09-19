@@ -2,12 +2,15 @@
   "mcpServers": {
     "temporal-engine": {
       "command": "D:\\masti\\venv\\Scripts\\python.exe",
-      "args": ["-m", "temporal_engine.mcp_server"],
+      "args": [
+        "-m",
+        "temporal_engine.mcp_server"
+      ],
       "cwd": "D:\\masti",
       "env": {
         "PYTHONPATH": "D:\\masti",
         "TEMPORAL_ENGINE_DB": "D:\\masti\\temporal_engine.db",
-        "TEMPORAL_ENGINE_TZ": "UTC"
+        "TEMPORAL_ENGINE_TZ": "Asia/Kolkata"
       }
     }
   }

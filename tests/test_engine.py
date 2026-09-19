@@ -108,3 +108,39 @@ def test_day_tracker_fires_new_day_exactly_once_per_crossing():
     assert first == []
     assert len(second) == 1 and second[0].event_type.value == "NEW_DAY"
     assert third == []  # same day as `second` -- must not fire again
+
+
+def test_a_deadline_only_task_becomes_overdue():
+    """Regression: with no scheduled window the task sat at CREATED forever,
+    because tick only considered deadlines for SCHEDULED/ACTIVE/WINDOW_ENDED."""
+    now = datetime(2026, 9, 12, 12, 0, tzinfo=UTC)
+    t = Task.new("report", "UTC", deadline=now - timedelta(hours=1))
+    assert t.status == TaskStatus.CREATED
+
+    events = tick([t], now, DayTracker(), day_boundary_tz="UTC")
+
+    assert t.status == TaskStatus.OVERDUE
+    assert [e.event_type for e in events] == [EventType.TASK_DEADLINE_BREACHED]
+
+
+def test_new_day_records_the_local_midnight_as_valid_time_and_the_notice_as_recorded_time():
+    from zoneinfo import ZoneInfo
+    kolkata = ZoneInfo("Asia/Kolkata")
+    tracker = DayTracker()
+    tracker.check(datetime(2026, 9, 12, 23, 0, tzinfo=kolkata), "Asia/Kolkata")
+
+    noticed = datetime(2026, 9, 14, 9, 30, tzinfo=kolkata)      # noticed 33 hours after the boundary
+    (event,) = tracker.check(noticed, "Asia/Kolkata")
+
+    assert event.occurred_at == datetime(2026, 9, 14, 0, 0, tzinfo=kolkata)
+    assert event.recorded_at == noticed
+
+
+def test_the_day_boundary_follows_the_configured_timezone_not_utc():
+    """23:00 UTC on the 12th is already the 13th at +05:30 -- the reason a
+    server left on UTC would announce a new day at 05:30 local time."""
+    from zoneinfo import ZoneInfo
+    tracker = DayTracker()
+    assert tracker.check(datetime(2026, 9, 12, 17, 0, tzinfo=UTC), "Asia/Kolkata") == []   # 22:30 IST, the 12th
+    events = tracker.check(datetime(2026, 9, 12, 19, 0, tzinfo=UTC), "Asia/Kolkata")       # 00:30 IST, the 13th
+    assert len(events) == 1 and events[0].payload["new_date"] == "2026-09-13"

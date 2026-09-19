@@ -11,7 +11,7 @@ without a database in the loop at all.
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Iterable, Optional
 from zoneinfo import ZoneInfo
 
@@ -35,7 +35,8 @@ class DayTracker:
         self._last_seen_date: Optional[date] = last_seen_date
 
     def check(self, now: datetime, day_boundary_tz: str) -> list[TemporalEvent]:
-        local_date = now.astimezone(ZoneInfo(day_boundary_tz)).date()
+        tz = ZoneInfo(day_boundary_tz)
+        local_date = now.astimezone(tz).date()
 
         if self._last_seen_date is None:
             self._last_seen_date = local_date
@@ -46,7 +47,10 @@ class DayTracker:
 
         event = TemporalEvent(
             event_type=EventType.NEW_DAY,
-            occurred_at=now,
+            # Valid time is the boundary itself, not when we noticed it:
+            # after downtime those differ by hours or days, and "when did
+            # the day change" must not depend on when the app was reopened.
+            occurred_at=datetime.combine(local_date, time.min, tzinfo=tz),
             recorded_at=now,
             payload={
                 "previous_date": self._last_seen_date.isoformat(),
@@ -90,8 +94,12 @@ def tick(
             task.apply_transition(TaskStatus.WINDOW_ENDED, at=now)
             events.append(TemporalEvent(EventType.TASK_WINDOW_ENDED, task.scheduled_end, now, task.id))
 
+        # CREATED is included: a task with only a deadline and no window is
+        # still overdue once the deadline passes.
         if (
-            task.status in (TaskStatus.SCHEDULED, TaskStatus.ACTIVE, TaskStatus.WINDOW_ENDED)
+            task.status in (
+                TaskStatus.CREATED, TaskStatus.SCHEDULED, TaskStatus.ACTIVE, TaskStatus.WINDOW_ENDED,
+            )
             and task.deadline
             and now >= task.deadline
         ):

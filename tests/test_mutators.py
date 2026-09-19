@@ -3,13 +3,15 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from temporal_engine.mutators import (
-    DEFAULT_MAX_LINEAGE_LENGTH,
+    DEFAULT_MAX_MOVES,
     RescheduleCapExceeded,
     carry_forward_task,
     cancel_task,
     complete_task,
+    create_task,
     lineage_length,
     reschedule_task,
+    start_task,
 )
 from temporal_engine.task import Task, TaskStatus
 
@@ -72,7 +74,7 @@ def test_reschedule_cap_is_enforced_after_max_lineage_length():
 
     current_id = t.id
     now = datetime(2026, 1, 1, 14, tzinfo=UTC)
-    for _ in range(DEFAULT_MAX_LINEAGE_LENGTH):
+    for _ in range(DEFAULT_MAX_MOVES):
         now += timedelta(hours=1)
         new_task, _ = reschedule_task(
             tasks, current_id, new_start=now, new_end=now + timedelta(hours=1), now=now,
@@ -140,3 +142,91 @@ def test_completing_an_already_terminal_task_is_rejected():
     complete_task(t, now=datetime(2026, 1, 1, tzinfo=UTC))
     with pytest.raises(ValueError):
         complete_task(t, now=datetime(2026, 1, 2, tzinfo=UTC))
+
+
+# ---- rate-limit semantics of the cap ----
+
+def test_moves_spread_beyond_the_window_are_not_capped():
+    """A chore carried forward one day at a time must never get stuck; only a
+    burst of moves (the runaway shape) is stopped."""
+    tasks = {}
+    t = Task.new("laundry", "UTC", scheduled_start=datetime(2026, 1, 1, 9, tzinfo=UTC))
+    tasks[t.id] = t
+    current_id = t.id
+    now = datetime(2026, 1, 1, 9, tzinfo=UTC)
+    for day in range(1, 8):  # seven carry-forwards, one per day
+        now = datetime(2026, 1, 1, 9, tzinfo=UTC) + timedelta(days=day)
+        new_task, _ = carry_forward_task(
+            tasks, current_id, new_start=now, new_end=now + timedelta(hours=1), now=now,
+        )
+        current_id = new_task.id
+    assert lineage_length(tasks, current_id) == 7
+
+
+# ---- validation of times ----
+
+def test_reschedule_past_the_tasks_own_deadline_is_rejected():
+    tasks = {}
+    now = datetime(2026, 1, 1, 9, tzinfo=UTC)
+    t = Task.new("report", "UTC", scheduled_start=now + timedelta(hours=1),
+                 scheduled_end=now + timedelta(hours=2), deadline=now + timedelta(hours=5))
+    tasks[t.id] = t
+    with pytest.raises(ValueError, match="before the deadline"):
+        reschedule_task(tasks, t.id, now + timedelta(hours=10), now + timedelta(hours=11), now)
+    assert t.status == TaskStatus.SCHEDULED  # nothing was mutated
+
+
+def test_extending_the_deadline_explicitly_allows_the_move():
+    tasks = {}
+    now = datetime(2026, 1, 1, 9, tzinfo=UTC)
+    t = Task.new("report", "UTC", scheduled_start=now + timedelta(hours=1),
+                 scheduled_end=now + timedelta(hours=2), deadline=now + timedelta(hours=5))
+    tasks[t.id] = t
+    new_task, _ = reschedule_task(
+        tasks, t.id, now + timedelta(hours=10), now + timedelta(hours=11), now,
+        new_deadline=now + timedelta(hours=20),
+    )
+    assert new_task.deadline == now + timedelta(hours=20)
+
+
+# ---- create / start ----
+
+def test_create_task_registers_the_task_and_emits_a_created_event_carrying_the_key():
+    tasks = {}
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    task, events = create_task(tasks, now, "DSA", "UTC", idempotency_key="k1")
+    assert tasks[task.id] is task
+    assert events[0].event_type.value == "TASK_CREATED"
+    assert events[0].payload["idempotency_key"] == "k1"
+
+
+def test_create_task_rejects_invalid_input_without_registering_anything():
+    tasks = {}
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    with pytest.raises(ValueError):
+        create_task(tasks, now, "x", "UTC", scheduled_start=datetime(2026, 1, 1, 9))  # naive
+    assert tasks == {}
+
+
+def test_start_task_records_actual_start_once_and_does_not_change_status():
+    t = Task.new("DSA", "UTC", scheduled_start=datetime(2026, 1, 1, 14, tzinfo=UTC))
+    now = datetime(2026, 1, 1, 14, 5, tzinfo=UTC)
+    event = start_task(t, now)
+    assert t.actual_start == now
+    assert t.status == TaskStatus.SCHEDULED  # ACTIVE stays clock-derived
+    assert event.event_type.value == "TASK_WORK_STARTED"
+    with pytest.raises(ValueError, match="already started"):
+        start_task(t, now + timedelta(minutes=1))
+
+
+def test_start_task_refuses_a_finished_task():
+    t = Task.new("DSA", "UTC", scheduled_start=datetime(2026, 1, 1, 14, tzinfo=UTC))
+    complete_task(t, datetime(2026, 1, 1, 15, tzinfo=UTC))
+    with pytest.raises(ValueError, match="finished"):
+        start_task(t, datetime(2026, 1, 1, 16, tzinfo=UTC))
+
+
+def test_unknown_task_id_is_a_readable_value_error():
+    with pytest.raises(ValueError, match="unknown task_id"):
+        reschedule_task({}, "nope", datetime(2026, 1, 1, tzinfo=UTC),
+                        datetime(2026, 1, 1, 1, tzinfo=UTC), datetime(2026, 1, 1, tzinfo=UTC))

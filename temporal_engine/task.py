@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 
 class TaskStatus(str, Enum):
@@ -45,7 +46,20 @@ TERMINAL_STATUSES = {
 # states legal from that state. Every arrow in the spec's markdown table
 # must appear here exactly once, and nothing else is allowed to appear.
 _TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
-    TaskStatus.CREATED: {TaskStatus.SCHEDULED, TaskStatus.CANCELLED},
+    # CREATED = exists but has no scheduled window (an inbox item, possibly
+    # with only a deadline). It can be finished, dropped or cancelled like
+    # any other task, can breach its deadline, and is scheduled by being
+    # superseded via reschedule_task. It never becomes ACTIVE/WINDOW_ENDED
+    # because it has no window.
+    TaskStatus.CREATED: {
+        TaskStatus.SCHEDULED,
+        TaskStatus.OVERDUE,
+        TaskStatus.COMPLETED,
+        TaskStatus.RESCHEDULED,
+        TaskStatus.CARRIED_FORWARD,
+        TaskStatus.DROPPED,
+        TaskStatus.CANCELLED,
+    },
     TaskStatus.SCHEDULED: {
         TaskStatus.ACTIVE,
         TaskStatus.OVERDUE,
@@ -98,6 +112,44 @@ def can_transition(from_status: TaskStatus, to_status: TaskStatus) -> bool:
     return to_status in _TRANSITIONS[from_status]
 
 
+def validate_schedule(
+    start: object,
+    end: object,
+    deadline: object,
+    labels: tuple[str, str, str] = ("scheduled_start", "scheduled_end", "deadline"),
+) -> None:
+    """Reject schedules that are malformed or self-contradictory.
+
+    Times can originate from an LLM or a client, i.e. untrusted input. A
+    naive datetime (no UTC offset) compared against an aware one raises
+    TypeError deep inside the engine -- and an uncaught TypeError inside
+    the scheduler loop used to kill it silently. So every path that can
+    create or move a task validates here, at the boundary, with a readable
+    reason. `labels` lets callers name the fields the way their own API
+    does (e.g. new_start for a reschedule).
+    """
+    label_start, label_end, label_deadline = labels
+    for label, value in ((label_start, start), (label_end, end), (label_deadline, deadline)):
+        if value is None:
+            continue
+        if not isinstance(value, datetime):
+            raise ValueError(f"{label} must be an ISO 8601 datetime, got {value!r}")
+        if value.tzinfo is None:
+            raise ValueError(f"{label} must include a UTC offset, got {value.isoformat()}")
+
+    if end is not None and start is None:
+        raise ValueError(f"{label_end} requires {label_start}")
+    if start is not None and end is not None and end <= start:
+        raise ValueError(
+            f"{label_end} ({end.isoformat()}) must be after {label_start} ({start.isoformat()})"
+        )
+    if start is not None and deadline is not None and start >= deadline:
+        raise ValueError(
+            f"{label_start} ({start.isoformat()}) must be before the {label_deadline} "
+            f"({deadline.isoformat()})"
+        )
+
+
 @dataclass
 class Task:
     id: str
@@ -110,6 +162,9 @@ class Task:
     recurrence: Optional[str] = None
     carried_from: Optional[str] = None
     last_transition_at: Optional[datetime] = None
+    # When work actually began, as told to us -- distinct from the
+    # clock-derived ACTIVE status, which only means the window opened.
+    actual_start: Optional[datetime] = None
 
     @staticmethod
     def new(
@@ -120,6 +175,14 @@ class Task:
         deadline: Optional[datetime] = None,
         recurrence: Optional[str] = None,
     ) -> "Task":
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError("title must be a non-empty string")
+        try:
+            ZoneInfo(display_timezone)
+        except (KeyError, ValueError, TypeError) as exc:
+            raise ValueError(f"unknown timezone {display_timezone!r} (expected an IANA name)") from exc
+        validate_schedule(scheduled_start, scheduled_end, deadline)
+
         status = TaskStatus.SCHEDULED if scheduled_start else TaskStatus.CREATED
         return Task(
             id=str(uuid.uuid4()),

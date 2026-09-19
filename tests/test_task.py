@@ -74,3 +74,71 @@ def test_can_transition_agrees_with_apply_transition(from_status, to_status):
     else:
         with pytest.raises(ValueError):
             t.apply_transition(to_status, at=now)
+
+
+# ---- validation at the boundary ----
+
+from datetime import timedelta  # noqa: E402
+
+from temporal_engine.task import validate_schedule  # noqa: E402
+
+_A = datetime(2026, 9, 12, 14, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("start, end, deadline, message", [
+    (datetime(2026, 9, 12, 14), None, None, "UTC offset"),                       # naive start
+    (_A, datetime(2026, 9, 12, 15), None, "UTC offset"),                         # naive end
+    (_A, _A + timedelta(hours=1), datetime(2026, 9, 12, 20), "UTC offset"),      # naive deadline
+    ("tomorrow", None, None, "ISO 8601"),                                        # not a datetime
+    (None, _A, None, "requires"),                                                # end without start
+    (_A, _A, None, "must be after"),                                             # zero-length window
+    (_A, _A - timedelta(hours=1), None, "must be after"),                        # backwards window
+    (_A, None, _A, "before the deadline"),                                       # starts at its deadline
+    (_A + timedelta(hours=2), None, _A, "before the deadline"),                  # starts after its deadline
+])
+def test_validate_schedule_rejects_bad_input_with_a_readable_reason(start, end, deadline, message):
+    with pytest.raises(ValueError, match=message):
+        validate_schedule(start, end, deadline)
+
+
+@pytest.mark.parametrize("start, end, deadline", [
+    (None, None, None),                                   # an inbox item
+    (None, None, _A),                                     # deadline only
+    (_A, None, None),                                     # start only
+    (_A, _A + timedelta(hours=1), None),
+    (_A, _A + timedelta(hours=1), _A + timedelta(hours=3)),
+    (_A, _A + timedelta(hours=5), _A + timedelta(hours=3)),   # window running past the deadline is allowed
+])
+def test_validate_schedule_accepts_legitimate_shapes(start, end, deadline):
+    validate_schedule(start, end, deadline)
+
+
+def test_task_new_refuses_to_construct_an_invalid_task():
+    with pytest.raises(ValueError, match="UTC offset"):
+        Task.new("x", "UTC", scheduled_start=datetime(2026, 9, 12, 14))
+    with pytest.raises(ValueError, match="timezone"):
+        Task.new("x", "Mars/Olympus")
+    with pytest.raises(ValueError, match="title"):
+        Task.new("   ", "UTC")
+
+
+def test_validate_schedule_names_fields_the_way_the_caller_does():
+    with pytest.raises(ValueError, match="new_end"):
+        validate_schedule(_A, _A, None, labels=("new_start", "new_end", "deadline"))
+
+
+# ---- an unscheduled (CREATED) task is a first-class inbox item ----
+
+@pytest.mark.parametrize("target", [
+    TaskStatus.COMPLETED, TaskStatus.DROPPED, TaskStatus.CANCELLED,
+    TaskStatus.OVERDUE, TaskStatus.RESCHEDULED,
+])
+def test_a_created_task_can_be_finished_dropped_or_moved(target):
+    """It used to be stuck: CREATED could only become SCHEDULED or CANCELLED,
+    so an unscheduled task could not even be completed."""
+    assert can_transition(TaskStatus.CREATED, target)
+
+
+def test_a_created_task_still_cannot_skip_to_a_window_state():
+    assert not can_transition(TaskStatus.CREATED, TaskStatus.ACTIVE)
+    assert not can_transition(TaskStatus.CREATED, TaskStatus.WINDOW_ENDED)

@@ -169,7 +169,9 @@ def run_scenario(provider: LLMProvider, scenario: Scenario) -> ScenarioResult:
         if scenario.allowed_actions and call.action not in scenario.allowed_actions:
             failures.append(f"{call.action} is not an allowed action here ({sorted(scenario.allowed_actions)})")
         decision = apply_action(tasks, call, ctx.now, seen)[0]
-        if decision.payload["outcome"] != "applied":
+        # A held action is a correct outcome: the deterministic layer did
+        # its job by not acting without a human.
+        if decision.payload["outcome"] not in ("applied", "pending_confirmation"):
             failures.append(
                 f"{call.action} was {decision.payload['outcome']} by the deterministic layer: "
                 f"{decision.payload.get('rejection_reason')}"

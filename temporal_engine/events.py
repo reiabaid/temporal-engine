@@ -26,6 +26,9 @@ class EventType(str, Enum):
     TASK_CARRIED_FORWARD = "TASK_CARRIED_FORWARD"
     TASK_DROPPED = "TASK_DROPPED"
     TASK_CANCELLED = "TASK_CANCELLED"
+    # A fact reported by the user/agent (work actually began), not a status
+    # change -- the clock-derived ACTIVE status only means the window opened.
+    TASK_WORK_STARTED = "TASK_WORK_STARTED"
 
 
 SCHEMA_VERSION = 1
@@ -40,3 +43,7 @@ class TemporalEvent:
     payload: dict[str, Any] = field(default_factory=dict)
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     schema_version: int = SCHEMA_VERSION
+    # Position in the log; assigned by storage, None for an event that has
+    # not been persisted yet. This is the cursor callers use to ask "what
+    # happened since I last looked".
+    seq: Optional[int] = None
