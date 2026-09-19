@@ -28,22 +28,28 @@ from temporal_engine.mutators import (
     carry_forward_task,
     cancel_task,
     complete_task,
+    create_recurrence,
     create_task,
+    end_recurrence,
     get_task,
     reschedule_task,
     start_task,
 )
+from temporal_engine.recurrence import Recurrence
 from temporal_engine.task import Task
 
 # Argument names that hold datetimes, so a logged call can be turned back
 # into a live one when a held action is confirmed.
 _DATETIME_ARGS = ("new_start", "new_end", "new_deadline", "scheduled_start", "scheduled_end", "deadline")
+# (Recurrence dates such as first_date/until stay ISO strings: they are
+# calendar dates, not instants, and build_recurrence parses them.)
 
 
 @dataclass
 class ActionCall:
     idempotency_key: str
     action: str  # create_task | start_task | complete_task | reschedule_task | carry_forward_task | cancel_task
+    #              | create_recurrence | end_recurrence
     task_id: Optional[str]
     args: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
@@ -84,6 +90,7 @@ def apply_action(
     now: datetime,
     seen_idempotency_keys: set[str],
     confirmed: bool = False,
+    recurrences: Optional[dict[str, Recurrence]] = None,
 ) -> list[TemporalEvent]:
     """Validate and apply one ActionCall. Always returns at least the
     ACTION_PROPOSED decision event; on success it is followed by whatever
@@ -100,7 +107,7 @@ def apply_action(
         return [_decision_event(call, now, "pending_confirmation")]
 
     try:
-        events = _dispatch(tasks, call, now)
+        events = _dispatch(tasks, call, now, recurrences)
     except (ValueError, RescheduleCapExceeded) as exc:
         return [_decision_event(call, now, "rejected", str(exc))]
 
@@ -114,8 +121,18 @@ def decline_event(call: ActionCall, now: datetime, reason: str = "declined by a 
     return _decision_event(call, now, "rejected", reason)
 
 
-def _dispatch(tasks: dict[str, Task], call: ActionCall, now: datetime) -> list[TemporalEvent]:
+def _dispatch(
+    tasks: dict[str, Task], call: ActionCall, now: datetime, recurrences: Optional[dict[str, Recurrence]] = None,
+) -> list[TemporalEvent]:
     a = call.args
+
+    if call.action in ("create_recurrence", "end_recurrence"):
+        if recurrences is None:
+            raise ValueError("this caller does not support recurring tasks")
+        if call.action == "create_recurrence":
+            _, events = create_recurrence(recurrences, now, a, call.idempotency_key)
+            return events
+        return [end_recurrence(recurrences, a.get("recurrence_id"), now)]
 
     if call.action == "create_task":
         _, events = create_task(

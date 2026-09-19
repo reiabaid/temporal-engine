@@ -35,6 +35,7 @@ from typing import Iterable, Iterator, Optional
 from zoneinfo import ZoneInfo
 
 from temporal_engine.events import EventType, TemporalEvent
+from temporal_engine.recurrence import Recurrence
 from temporal_engine.task import Task, TaskStatus
 
 log = logging.getLogger("temporal_engine")
@@ -197,6 +198,13 @@ class View:
     # How far the agent loop has processed trigger events (None = never run).
     agent_cursor: Optional[int] = None
     last_new_day: Optional[date] = None
+    # Recurring templates, and which (template id, local date) occurrences
+    # already exist -- created, skipped (cancelled) or moved all count, so a
+    # skipped occurrence is never quietly recreated. gap_through[id] is the
+    # last date deliberately not generated after downtime.
+    recurrences: dict[str, Recurrence] = field(default_factory=dict)
+    materialized: set[tuple[str, str]] = field(default_factory=set)
+    gap_through: dict[str, date] = field(default_factory=dict)
     first_event_at: Optional[datetime] = None
     quarantined: list[tuple[int, str]] = field(default_factory=list)
 
@@ -222,12 +230,16 @@ def _apply_to_tasks(tasks: dict[str, Task], event: TemporalEvent) -> None:
             scheduled_end=_parse_dt(p.get("scheduled_end")),
             deadline=_parse_dt(p.get("deadline")),
             status=TaskStatus(p["status"]),
-            recurrence=p.get("recurrence"),
             carried_from=p.get("carried_from"),
+            recurrence_id=p.get("recurrence_id"),
+            occurrence=p.get("occurrence"),
         )
         return
 
-    if kind in (EventType.NEW_DAY, EventType.ACTION_PROPOSED, EventType.AGENT_CHECKPOINT):
+    if kind in (
+        EventType.NEW_DAY, EventType.ACTION_PROPOSED, EventType.AGENT_CHECKPOINT,
+        EventType.RECURRENCE_CREATED, EventType.RECURRENCE_ENDED, EventType.RECURRENCE_GAP,
+    ):
         return  # not about one task's status
 
     task = tasks[event.task_id]
@@ -267,6 +279,21 @@ def _index(view: View, event: TemporalEvent) -> None:
         key = event.payload.get("idempotency_key")
         if key:
             view.created_by_key[key] = event.task_id
+        rid, occurrence = event.payload.get("recurrence_id"), event.payload.get("occurrence")
+        if rid and occurrence:
+            view.materialized.add((rid, occurrence))
+
+    elif event.event_type == EventType.RECURRENCE_CREATED:
+        recurrence = Recurrence.from_payload(event.payload)
+        view.recurrences[recurrence.id] = recurrence
+        if event.payload.get("idempotency_key"):
+            view.created_by_key[event.payload["idempotency_key"]] = recurrence.id
+
+    elif event.event_type == EventType.RECURRENCE_ENDED:
+        view.recurrences[event.payload["recurrence_id"]].ended = True   # KeyError -> quarantined
+
+    elif event.event_type == EventType.RECURRENCE_GAP:
+        view.gap_through[event.payload["recurrence_id"]] = date.fromisoformat(event.payload["through_date"])
 
     elif event.event_type == EventType.AGENT_CHECKPOINT:
         through = int(event.payload["through_seq"])
@@ -402,9 +429,11 @@ def task_created_event(task: Task, at: datetime, idempotency_key: Optional[str] 
         "scheduled_end": task.scheduled_end.isoformat() if task.scheduled_end else None,
         "deadline": task.deadline.isoformat() if task.deadline else None,
         "status": task.status.value,
-        "recurrence": task.recurrence,
         "carried_from": task.carried_from,
     }
+    if task.recurrence_id:
+        payload["recurrence_id"] = task.recurrence_id
+        payload["occurrence"] = task.occurrence
     if idempotency_key:
         payload["idempotency_key"] = idempotency_key
     return TemporalEvent(

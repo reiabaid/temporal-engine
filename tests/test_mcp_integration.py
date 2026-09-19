@@ -410,3 +410,35 @@ def test_the_agent_acts_unattended_and_the_move_limit_stops_a_runaway(tmp_path):
              and e["detail"]["action_call"]["idempotency_key"].startswith("agent:")]
     assert len(later) == 4                                # no further decisions after the refusal
     assert final["agent"]["enabled"] is True and final["agent"]["last_error"] is None
+
+
+# ------------------------------------------------------------------ recurrence
+
+def test_recurring_tasks_over_mcp(tmp_path):
+    async def scenario():
+        async with _session(tmp_path / "t.db") as s:
+            args = {"title": "gym", "timezone": "Asia/Kolkata", "frequency": "daily", "start_time": "18:00",
+                    "duration_minutes": 60, "idempotency_key": "recurring-1"}
+            made = await _call(s, "create_recurring_task", args)
+            retry = await _call(s, "create_recurring_task", args)
+            bad = await _call(s, "create_recurring_task", {**args, "idempotency_key": "x", "frequency": "hourly"})
+            before = await _call(s, "get_temporal_context")
+            ended = await _call(s, "end_recurring_task", {"recurrence_id": made["recurrence"]["id"]})
+            after = await _call(s, "get_temporal_context")
+            with_ended = await _call(s, "get_temporal_context", {"include_finished": True})
+            return made, retry, bad, before, ended, after, with_ended
+
+    made, retry, bad, before, ended, after, with_ended = asyncio.run(scenario())
+
+    assert made["outcome"] == "applied" and len(made["instances"]) == 8      # today through a week ahead
+    assert all(i["recurrence_id"] == made["recurrence"]["id"] for i in made["instances"])
+    assert made["recurrence"]["rule"] == "every day at 18:00 Asia/Kolkata for 60 min"
+    assert len(made["recurrence"]["next_occurrences"]) == 3
+
+    assert retry["outcome"] == "superseded" and retry["recurrence"]["id"] == made["recurrence"]["id"]
+    assert bad["outcome"] == "rejected" and "frequency must be one of" in bad["rejection_reason"]
+
+    assert len(before["tasks"]) == 8 and [r["id"] for r in before["recurrences"]] == [made["recurrence"]["id"]]
+    assert ended["outcome"] == "applied" and ended["recurrence"]["ended"] is True
+    assert after["recurrences"] == [] and len(after["tasks"]) == 8            # stopped, but nothing already made was touched
+    assert [r["ended"] for r in with_ended["recurrences"]] == [True]

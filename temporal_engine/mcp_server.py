@@ -25,6 +25,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from mcp.server.mcpserver import Context, MCPServer
 
@@ -32,6 +33,7 @@ from temporal_engine.actions import ActionCall, lenient_datetime
 from temporal_engine.agent import Agent, AgentConfig, provider_from_env
 from temporal_engine.events import EventType, TemporalEvent
 from temporal_engine.overlap import find_conflicts, find_overlapping
+from temporal_engine.recurrence import Recurrence, next_occurrences
 from temporal_engine.runtime import Runtime
 from temporal_engine.task import Task
 
@@ -91,12 +93,26 @@ def _task_summary(task: Task, now: datetime) -> dict[str, Any]:
         "carried_from": task.carried_from,
         "actual_start": _iso(task.actual_start),
     }
+    if task.recurrence_id:
+        summary["recurrence_id"] = task.recurrence_id
+        summary["occurrence"] = task.occurrence
     if task.actual_start is not None:
         # Elapsed work is deterministic arithmetic, so the server does it
         # rather than leaving it to the model.
         end = task.last_transition_at if task.is_terminal() and task.last_transition_at else now
         summary["worked_seconds"] = max(0, int((end - task.actual_start).total_seconds()))
     return summary
+
+
+def _recurrence_summary(rec: Recurrence, now: datetime) -> dict[str, Any]:
+    return {
+        "id": rec.id,
+        "title": rec.title,
+        "rule": rec.describe(),
+        "timezone": rec.display_timezone,
+        "ended": rec.ended,
+        "next_occurrences": [dt.isoformat() for dt in next_occurrences(rec, now, 3)],
+    }
 
 
 def _event_summary(event: TemporalEvent) -> dict[str, Any]:
@@ -185,7 +201,7 @@ async def get_temporal_context(
     active = [t for t in view.tasks.values() if not t.is_terminal()]
     health = runtime.health
     out: dict[str, Any] = {
-        "now": now.isoformat(),
+        "now": now.astimezone(ZoneInfo(runtime.day_boundary_tz)).isoformat(),   # display only
         "day_boundary_timezone": runtime.day_boundary_tz,
         "is_scheduler_process": health.is_scheduler,
         "scheduler": {
@@ -205,6 +221,10 @@ async def get_temporal_context(
             {"idempotency_key": key, "action": c["action"], "task_id": c.get("task_id"),
              "reason": c.get("reason", ""), "args": c.get("args", {})}
             for key, c in view.pending.items()
+        ],
+        "recurrences": [
+            _recurrence_summary(r, now) for r in view.recurrences.values()
+            if include_finished or not r.ended
         ],
         "events": [_event_summary(e) for e in events],
         "events_truncated": truncated,
@@ -260,6 +280,83 @@ async def create_task(
         "scheduled_end": lenient_datetime(scheduled_end),
         "deadline": lenient_datetime(deadline),
     }, "", idempotency_key)
+
+
+def _recurrence_result(runtime: Runtime, call: ActionCall, events: list[TemporalEvent]) -> dict[str, Any]:
+    view, now = runtime.store.view, runtime.clock.now()
+    decision = events[0]
+    rec_id = next((e.payload["id"] for e in events if e.event_type == EventType.RECURRENCE_CREATED), None)
+    if rec_id is None:
+        rec_id = (call.args or {}).get("recurrence_id") or view.created_by_key.get(call.idempotency_key)
+    rec = view.recurrences.get(rec_id) if rec_id else None
+    return {
+        "outcome": decision.payload["outcome"],
+        "rejection_reason": decision.payload.get("rejection_reason"),
+        "idempotency_key": call.idempotency_key,
+        "recurrence": _recurrence_summary(rec, now) if rec else None,
+        "instances": [
+            _task_summary(view.tasks[e.task_id], now)
+            for e in events if e.event_type == EventType.TASK_CREATED and e.task_id in view.tasks
+        ],
+        "occurrences_skipped": sum(
+            e.payload["skipped"] for e in events if e.event_type == EventType.RECURRENCE_GAP
+        ),
+    }
+
+
+@mcp.tool()
+async def create_recurring_task(
+    ctx: Context,
+    title: str,
+    timezone: str,
+    frequency: str,
+    start_time: str,
+    duration_minutes: Optional[int] = None,
+    interval: int = 1,
+    weekdays: Optional[list[str]] = None,
+    month_days: Optional[list[int]] = None,
+    first_date: Optional[str] = None,
+    until: Optional[str] = None,
+    count: Optional[int] = None,
+    idempotency_key: Optional[str] = None,
+) -> dict[str, Any]:
+    """Create a task that repeats. `frequency` is daily, weekly or monthly;
+    `interval` is every N of them. `start_time` is HH:MM LOCAL time in
+    `timezone` (an IANA name) and stays that wall-clock time across daylight
+    saving changes. weekly takes `weekdays` (MO TU WE TH FR SA SU; default:
+    the first date's weekday); monthly takes `month_days` (1-31; a day a
+    month lacks is skipped, not clamped). `first_date` (YYYY-MM-DD, default
+    today) anchors it; bound it with `until` (inclusive) or `count`, not both.
+
+    Each occurrence becomes an ordinary task, created about a week ahead and
+    returned in `instances`. To skip one occurrence, cancel that task; to
+    change one, reschedule it; complete one as usual -- none affects the
+    others. Use end_recurring_task to stop the series."""
+    runtime: Runtime = ctx.request_context.lifespan_context
+    call = ActionCall(
+        idempotency_key=idempotency_key or str(uuid.uuid4()), action="create_recurrence", task_id=None,
+        args={
+            "title": title, "display_timezone": timezone, "frequency": frequency, "start_time": start_time,
+            "duration_minutes": duration_minutes, "interval": interval, "weekdays": weekdays,
+            "month_days": month_days, "first_date": first_date, "until": until, "count": count,
+        },
+    )
+    return _recurrence_result(runtime, call, runtime.execute(call))
+
+
+@mcp.tool()
+async def end_recurring_task(
+    ctx: Context, recurrence_id: str, idempotency_key: Optional[str] = None,
+) -> dict[str, Any]:
+    """Stop generating further occurrences of a recurring task. Occurrences
+    that already exist are ordinary tasks and are left alone; cancel any you
+    do not want."""
+    runtime: Runtime = ctx.request_context.lifespan_context
+    call = ActionCall(
+        idempotency_key=idempotency_key or str(uuid.uuid4()), action="end_recurrence", task_id=None,
+        args={"recurrence_id": recurrence_id},
+    )
+    return _recurrence_result(runtime, call, runtime.execute(call))
 
 
 @mcp.tool()

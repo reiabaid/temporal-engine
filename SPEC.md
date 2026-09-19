@@ -77,7 +77,7 @@ TemporalEvent {
 }
 ```
 
-`EventType`: `TASK_CREATED`, `TASK_STARTED`, `TASK_WINDOW_ENDED`, `TASK_DEADLINE_BREACHED`, `TASK_COMPLETED`, `TASK_RESCHEDULED`, `TASK_CARRIED_FORWARD`, `TASK_DROPPED`, `TASK_CANCELLED`, `TASK_WORK_STARTED`, `NEW_DAY`, `ACTION_PROPOSED`, `AGENT_CHECKPOINT` (§8).
+`EventType`: `TASK_CREATED`, `TASK_STARTED`, `TASK_WINDOW_ENDED`, `TASK_DEADLINE_BREACHED`, `TASK_COMPLETED`, `TASK_RESCHEDULED`, `TASK_CARRIED_FORWARD`, `TASK_DROPPED`, `TASK_CANCELLED`, `TASK_WORK_STARTED`, `NEW_DAY`, `ACTION_PROPOSED`, `AGENT_CHECKPOINT` (§8), `RECURRENCE_CREATED`, `RECURRENCE_ENDED`, `RECURRENCE_GAP` (§9).
 
 - `TASK_CREATED` carries a full snapshot of the task (needed so replay can rebuild it from the log alone) plus the `idempotency_key` of the action that created it, if any.
 - **Valid vs transaction time.** `TASK_STARTED` etc. are stamped with the boundary they represent (`occurred_at = scheduled_start`), and `recorded_at` is when the engine noticed. `NEW_DAY.occurred_at` is the local midnight of the new day, *not* the moment of detection — after downtime those differ by hours or days, and "when did the day change" must not depend on when the app was reopened.
@@ -149,6 +149,7 @@ All tools are `async` (§7, Threading). Mutating tools take an optional `idempot
 | `reschedule_task(task_id, new_start, new_end, reason, new_deadline?)` | Supersedes; use the returned `new_task.id`. |
 | `carry_forward_task(...)` | Same, to a later day. |
 | `cancel_task(task_id, mode, reason)` | `drop` or `cancel`. |
+| `create_recurring_task(title, timezone, frequency, start_time, ...)`, `end_recurring_task(recurrence_id)` | Recurring tasks (§9). |
 | `list_pending_actions()`, `confirm_action(key)`, `reject_action(key)` | The confirmation hold. |
 | `get_temporal_context(since_seq?, since?, event_limit?, include_finished?)` | See below. |
 
@@ -204,7 +205,8 @@ The SDK runs a *sync* tool on a worker thread. Engine state (task dict, SQLite c
 - All instants are stored in UTC.
 - A task's `display_timezone` (validated IANA name) is **for display only**. (v0.1 said it also drove the day boundary; that stopped being true in Phase 1 and the spec was not updated.)
 - The **day boundary** — what `NEW_DAY` means — is one engine-level setting, `TEMPORAL_ENGINE_TZ` (validated at startup; default `UTC`, so **set it**: left at UTC, a user at +05:30 gets a "new day" at 05:30 local). It is reported in `get_temporal_context`. One timezone means one user; shift workers and multi-timezone teams are not modelled.
-- DST is handled by not landing on ambiguous/nonexistent local hours where avoidable (see `exercises/timezone_practice.py`: compare midnight to midnight). Recurring tasks colliding with a DST transition are DEFERRED with recurrence itself.
+- **The clock reports UTC, and engine arithmetic is done on unambiguous datetimes.** Python compares and subtracts two aware datetimes that share one `ZoneInfo` object by their *wall-clock fields*, ignoring DST: `02:30 - 01:30` is "1 hour" even when two real hours passed, and during a repeated hour the two passes compare equal. A clock returning local time would share its `tzinfo` with any boundary built in the same zone and inherit this. So `RealClock.now()` is UTC, occurrence times are rendered with a *fixed offset* (what a datetime parsed from the log has anyway, so live and replayed values behave identically), local midnights are converted to UTC, and `TemporalContext` carries the user's timezone explicitly. Found by a failing test on a 60-minute occurrence crossing the fall-back hour (it would have failed validation as "ends before it starts" and poisoned every scheduler pass); guarded by tests that fail against the old behaviour.
+- DST rules for recurrence are in §9. `exercises/timezone_practice.py` (compare midnight to midnight) is the pattern for the day-boundary logic.
 
 ### Move rate limit
 
@@ -234,9 +236,25 @@ The design's original spine — scheduler event -> agent invocation -> LLM reaso
 
 ---
 
+## 9. Recurring tasks
+
+A recurring task is a **template** that generates ordinary tasks. The template (`RECURRENCE_CREATED`, in the log) holds title, timezone, rule, local start time and optional duration; each **occurrence** is a normal task with its own full lifecycle and carries `recurrence_id` plus `occurrence` (the local date, ISO). Completing, cancelling ("skip") or rescheduling one occurrence never affects another.
+
+**Rules.** `daily` every N days; `weekly` every N weeks on given weekdays (default: the anchor's weekday); `monthly` every N months on given days of month (default: the anchor's day); optionally bounded by `until` (inclusive local date) or `count`, never both. A day of month a month lacks (the 31st in April) is skipped, not clamped. Weeks start on Monday; for `interval > 1` the anchor's week is week 0. All input is validated with readable reasons (§1's rule: untrusted input becomes a logged rejection).
+
+**Time and DST.** `start_time` is local wall-clock time in the template's own timezone, so the UTC instant shifts with DST while the wall clock does not. A local time that does not exist (02:30 on a spring-forward day) resolves *forward* (to 03:30); one that occurs twice (01:30 on a fall-back day) resolves to its *first* occurrence. Duration is absolute: a 2-hour occurrence lasts two real hours across a transition. (See §7 for the datetime hazard this required guarding against.)
+
+**Generation is deterministic and idempotent.** An occurrence's identity is `(template id, local date)`. `materialize` creates every occurrence within the next 7 days that does not already exist, inside the scheduler's write transaction, *before* ticking (so an occurrence created already-over is ended by the same pass). Running it twice, from two processes, or after a crash creates each occurrence exactly once. A cancelled or rescheduled occurrence still counts as existing and is never quietly recreated; a moved occurrence keeps its identity. Creating a template generates its first occurrences in the *same transaction* and returns them, so a crash cannot leave a template with none.
+
+**After downtime.** Only occurrences from the last 24 hours are created (and read as missed, so an agent can respond to them); older ones are *not* — a month of downtime must not spawn a month of missed tasks. The omission is recorded once as `RECURRENCE_GAP {recurrence_id, through_date, skipped}`, so it is auditable rather than silent. A `first_date` in the past behaves the same way.
+
+**Tools.** `create_recurring_task` returns the template and its `instances`; `end_recurring_task` stops generation and leaves existing occurrences alone (cancel any you do not want). `get_temporal_context` lists `recurrences` (rule in words, next three occurrences); ended ones appear with `include_finished`.
+
+---
+
 ## Not done (explicit)
 
-- **Recurrence.** The `recurrence` field exists and nothing uses it. Needs an RRULE implementation and the DST-collision design. Phase 5.
+- **Recurrence is a deliberate subset** (§9): daily/weekly/monthly with interval, weekdays, days of month, `until`/`count`. No iCalendar RRULE strings, no yearly, no "nth weekday of the month", no exception dates (skip an occurrence by cancelling it), no per-series deadlines, and a template cannot be edited (end it and create a new one). The 7-day generation horizon and 24-hour catch-up lookback are fixed constants.
 - **External calendars, multiple editing agents beyond the write-lock protocol, multi-user / multi-timezone.**
 - **The agent loop is built but only ever run against the stub.** It is off by default, and no real model has driven it (§8).
 - **Live model behaviour.** No live call to any LLM has been made; provider code is tested against fakes and the scenarios against a stub.
@@ -270,6 +288,10 @@ Found by testing the running system, not by reading code. Each has a permanent r
 10. **No record of actual work start; overlaps unreported; injection unmitigated; confirmation hold unenforced.** Built (§1, §5, §3).
 11. **Scheduler handover:** the lock was tried once at startup, so a surviving client never took over. Fixed.
 12. `last_transition_at` differed between live and replayed tasks. Fixed and tested.
+
+### After v0.2 — recurrence
+
+Built §9. Writing its tests exposed a hazard that predated recurrence and would have bitten anything on a DST day: two aware datetimes sharing one `ZoneInfo` object are compared and subtracted by wall-clock time. A 60-minute occurrence across the fall-back hour failed validation as "ends before it starts"; the same trap sat latent in `RealClock` (local-zone `now` vs same-zone boundaries misjudges a repeated hour), the stub's slack arithmetic, and `worked_seconds`. Fixed as described in §7. Two mutations confirmed the guards: reverting the fixed offset fails the DST tests; removing the "already exists" check fails five recurrence tests.
 
 ### After v0.2 — the agent loop
 

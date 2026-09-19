@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from typing import Protocol
+from zoneinfo import ZoneInfo
 
 from temporal_engine.actions import ActionCall
 from temporal_engine.events import EventType, TemporalEvent
@@ -28,6 +29,10 @@ class TemporalContext:
     now: datetime
     events: list[TemporalEvent]
     tasks: list[Task]
+    # The user's timezone (IANA). `now` is an unambiguous instant, usually
+    # UTC, and says nothing about what "today", "midnight" or "9am" mean to
+    # the person -- this does.
+    timezone: str = "UTC"
 
 
 class LLMProvider(Protocol):
@@ -67,8 +72,13 @@ class StubHeuristicLLM:
 
     def _handle_window_ended(self, ctx: TemporalContext, event: TemporalEvent) -> ActionCall:
         task = next(t for t in ctx.tasks if t.id == event.task_id)
+        utc = timezone.utc
+        local = ZoneInfo(ctx.timezone)
+        now = ctx.now.astimezone(utc)          # all arithmetic on UTC instants: exact across DST
+        local_today = now.astimezone(local).date()
+
         duration = (
-            task.scheduled_end - task.scheduled_start
+            task.scheduled_end.astimezone(utc) - task.scheduled_start.astimezone(utc)
             if task.scheduled_start and task.scheduled_end
             else timedelta(hours=1)
         )
@@ -81,37 +91,38 @@ class StubHeuristicLLM:
         # would run past midnight. Fixed by always capping slack at
         # whichever comes first.
         next_midnight = datetime.combine(
-            ctx.now.date() + timedelta(days=1), time.min, tzinfo=ctx.now.tzinfo
-        )
+            local_today + timedelta(days=1), time.min, tzinfo=local
+        ).astimezone(utc)
         remaining_today = [
             t for t in ctx.tasks
             if t.status == TaskStatus.SCHEDULED
             and t.scheduled_start
-            and t.scheduled_start.date() == ctx.now.date()
-            and t.scheduled_start > ctx.now
+            and t.scheduled_start.astimezone(local).date() == local_today
+            and t.scheduled_start > now
         ]
-        boundaries = [next_midnight] + [t.scheduled_start for t in remaining_today]
-        slack = min(boundaries) - ctx.now
+        boundaries = [next_midnight] + [t.scheduled_start.astimezone(utc) for t in remaining_today]
+        slack = min(boundaries) - now
 
         if slack > timedelta(minutes=30):
-            new_end = ctx.now + min(duration, slack)
+            new_end = now + min(duration, slack)
             return ActionCall(
                 idempotency_key=str(uuid.uuid4()),
                 action="reschedule_task",
                 task_id=task.id,
-                args={"new_start": ctx.now, "new_end": new_end},
+                args={"new_start": now, "new_end": new_end},
                 reason=(
                     f"{int(slack.total_seconds() // 60)} min of slack before the "
                     f"next task; squeezing '{task.title}' in now."
                 ),
             )
         else:
-            tomorrow = ctx.now.date() + timedelta(days=1)
-            new_start = datetime.combine(tomorrow, time(9, 0), tzinfo=ctx.now.tzinfo)
+            tomorrow_9am = datetime.combine(
+                local_today + timedelta(days=1), time(9, 0), tzinfo=local
+            ).astimezone(utc)
             return ActionCall(
                 idempotency_key=str(uuid.uuid4()),
                 action="carry_forward_task",
                 task_id=task.id,
-                args={"new_start": new_start, "new_end": new_start + duration},
+                args={"new_start": tomorrow_9am, "new_end": tomorrow_9am + duration},
                 reason="No slack left today; carrying forward to tomorrow's plan.",
             )

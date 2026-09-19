@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from temporal_engine.actions import ActionCall, lenient_datetime
 from temporal_engine.providers import TemporalContext
@@ -93,7 +94,12 @@ def clean_title(title: str) -> str:
 
 
 def build_prompt(ctx: TemporalContext) -> str:
-    lines = [f"Current time: {ctx.now.isoformat()}", "", "Events since the last check:"]
+    local_now = ctx.now.astimezone(ZoneInfo(ctx.timezone))
+    lines = [
+        f"Current time: {local_now.isoformat()} (the user's timezone is {ctx.timezone}; "
+        f"'today' and 'midnight' mean local ones)",
+        "", "Events since the last check:",
+    ]
     if not ctx.events:
         lines.append("- (none)")
     for e in ctx.events:

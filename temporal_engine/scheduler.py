@@ -9,7 +9,7 @@ there. See PLAN.md's "wake-up mechanism" decision for why this matters.
 """
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
@@ -31,7 +31,12 @@ class RealClock(Clock):
         self.tz = ZoneInfo(tz_name)
 
     def now(self) -> datetime:
-        return datetime.now(self.tz)
+        # UTC on purpose. A ZoneInfo-aware `now` shares its tzinfo object
+        # with any boundary built in the same zone, and Python then
+        # compares/subtracts them by wall-clock time -- wrong by an hour
+        # across a DST change. UTC never is. Local dates are derived with
+        # .astimezone(tz), which is what the day logic already does.
+        return datetime.now(timezone.utc)
 
 
 class SimulatedClock(Clock):
@@ -58,7 +63,7 @@ def _next_local_midnight(now: datetime, tz_name: str) -> datetime:
     tz = ZoneInfo(tz_name)
     local_now = now.astimezone(tz)
     next_day = local_now.date() + timedelta(days=1)
-    return datetime.combine(next_day, time.min, tzinfo=tz)
+    return datetime.combine(next_day, time.min, tzinfo=tz).astimezone(timezone.utc)
 
 
 def next_wake_time(tasks: Iterable[Task], now: datetime, day_boundary_tz: str) -> datetime:

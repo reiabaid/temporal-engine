@@ -34,6 +34,14 @@ class EventType(str, Enum):
     # resumes where it left off instead of re-deciding (and re-paying for)
     # old events, and so a handover between processes agrees on the cursor.
     AGENT_CHECKPOINT = "AGENT_CHECKPOINT"
+    # Recurring tasks: a template lives in the log; its occurrences are
+    # ordinary tasks (TASK_CREATED carrying recurrence_id + occurrence).
+    RECURRENCE_CREATED = "RECURRENCE_CREATED"
+    RECURRENCE_ENDED = "RECURRENCE_ENDED"
+    # "This many occurrences were not created because they were too old to
+    # matter" (the app was closed for a long time). Recorded once, so the
+    # omission is auditable rather than silent.
+    RECURRENCE_GAP = "RECURRENCE_GAP"
 
 
 SCHEMA_VERSION = 1

@@ -5,7 +5,7 @@
 > - **`ask_user` was dropped**, replaced by a confirmation hold (`requires_confirmation` + `confirm_action`/`reject_action`).
 > - **The "single process, no daemon" decision was extended**: every process runs the same loop and any of them can become the scheduler, because a lock tried once at startup left nobody ticking when the holder exited.
 > - **The real work surfaced after Phase 4.** An audit of the running system found the two-clients-one-database case could corrupt the log; fixing it changed the architecture (writes validated against the log under a write lock). The plan's "optimistic concurrency in Phase 5" was too late and too weak.
-> - **Not started:** Phase 5 recurrence (nothing uses the `recurrence` field), Phase 6 benchmark beyond four fixtures, Phase 7 release. No live LLM has been run; Claude Desktop was never tested.
+> - **Not started:** Phase 6 benchmark beyond four fixtures, Phase 7 release. (Phase 5's recurrence and the unattended agent loop are built; see SPEC.md sections 8 and 9.) No live LLM has been run; Claude Desktop was never tested.
 > - The plan's Phase 3 question of events reaching a human without polling was answered negatively: nothing observed suggests push works, so pull is the only reliable channel.
 
 

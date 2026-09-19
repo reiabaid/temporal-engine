@@ -169,8 +169,7 @@ class Agent:
         task = view.tasks.get(event.task_id)
         return task is not None and not task.is_terminal()
 
-    @staticmethod
-    def _context(view: View, relevant: list[TemporalEvent], now: datetime) -> TemporalContext:
+    def _context(self, view: View, relevant: list[TemporalEvent], now: datetime) -> TemporalContext:
         """A private deep copy: the provider runs on a worker thread, and
         must not be able to observe or mutate live engine state."""
         unfinished: list[Task] = [t for t in view.tasks.values() if not t.is_terminal()]
@@ -178,6 +177,7 @@ class Agent:
             now=now,
             events=copy.deepcopy(relevant),
             tasks=copy.deepcopy(unfinished),
+            timezone=self.runtime.day_boundary_tz,
         )
 
     def _checkpoint(self, through_seq: int, batch_id: str, proposed: int, outcomes: list, note: str = "") -> None:

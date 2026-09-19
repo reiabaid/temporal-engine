@@ -33,8 +33,9 @@ from zoneinfo import ZoneInfo
 
 from temporal_engine.actions import ActionCall, apply_action, decline_event, action_call_from_payload
 from temporal_engine.engine import DayTracker, tick
-from temporal_engine.events import TemporalEvent
+from temporal_engine.events import EventType, TemporalEvent
 from temporal_engine.lock import SchedulerLock, SchedulerLockHeld
+from temporal_engine.mutators import materialize
 from temporal_engine.scheduler import Clock, RealClock, next_wake_time
 from temporal_engine.storage import Store
 
@@ -110,8 +111,14 @@ class Runtime:
                     # lock can take a moment, and boundaries must be judged
                     # against the time at which we actually hold it.
                     now = self.clock.now()
-                    events = tick(view.tasks.values(), now, self._tracker, self.day_boundary_tz)
+                    # Materialize BEFORE ticking, so an occurrence created
+                    # already-over (a window missed within the lookback) is
+                    # ended by this same pass.
+                    events = materialize(view, now)
                     self.store.append(events)
+                    ticked = tick(view.tasks.values(), now, self._tracker, self.day_boundary_tz)
+                    self.store.append(ticked)
+                    events = events + ticked
                 if events:
                     self.health.last_tick_at = now
                     self.new_events.set()
@@ -155,9 +162,23 @@ class Runtime:
         write lock is held from refresh to commit."""
         now = self.clock.now()
         with self.store.transaction() as view:
-            events = apply_action(view.tasks, call, now, view.seen_keys, confirmed=confirmed)
-            self.store.append(events)
+            events = self._apply(view, call, now, confirmed)
         self.wake_event.set()
+        return events
+
+    def _apply(self, view, call: ActionCall, now, confirmed: bool) -> list[TemporalEvent]:
+        """Apply one action and persist it -- and, if it created a recurring
+        template, generate its occurrences in the SAME transaction, so the
+        caller gets them back immediately and a crash cannot leave a template
+        with no occurrences."""
+        events = apply_action(
+            view.tasks, call, now, view.seen_keys, confirmed=confirmed, recurrences=view.recurrences,
+        )
+        self.store.append(events)
+        if any(e.event_type == EventType.RECURRENCE_CREATED for e in events):
+            extra = materialize(view, now)
+            self.store.append(extra)
+            events = events + extra
         return events
 
     def confirm(self, idempotency_key: str) -> list[TemporalEvent]:
@@ -170,10 +191,7 @@ class Runtime:
             pending = view.pending.get(idempotency_key)
             if pending is None:
                 raise ValueError(f"no pending action with key {idempotency_key!r}")
-            events = apply_action(
-                view.tasks, action_call_from_payload(pending), now, view.seen_keys, confirmed=True,
-            )
-            self.store.append(events)
+            events = self._apply(view, action_call_from_payload(pending), now, confirmed=True)
         self.wake_event.set()
         return events
 
