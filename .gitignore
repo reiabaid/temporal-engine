@@ -7,3 +7,6 @@ __pycache__/
 *.lock
 .pytest_cache/
 .hypothesis/
+*.egg-info/
+build/
+dist/

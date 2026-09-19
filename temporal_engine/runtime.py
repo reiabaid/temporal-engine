@@ -81,6 +81,7 @@ class Runtime:
         self.agent = None  # set by the host if an Agent is enabled
 
         db_path = Path(db_path)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
         self.store = Store(str(db_path))
         self.lock = SchedulerLock(db_path.with_suffix(".lock"))
         self._tracker: Optional[DayTracker] = None

@@ -24,7 +24,8 @@ import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Mapping, Optional
 from zoneinfo import ZoneInfo
 
 from mcp.server.mcpserver import Context, MCPServer
@@ -39,7 +40,15 @@ from temporal_engine.task import Task
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-DB_PATH = os.environ.get("TEMPORAL_ENGINE_DB", "temporal_engine.db")
+def default_db_path(env: Mapping[str, str]) -> str:
+    """TEMPORAL_ENGINE_DB if set, else a fixed per-user location. A relative
+    default was a footgun: Claude Desktop, Claude Code and a terminal each
+    start the server in a different working directory, and would each
+    silently get their own separate database."""
+    return env.get("TEMPORAL_ENGINE_DB") or str(Path.home() / ".temporal-engine" / "temporal_engine.db")
+
+
+DB_PATH = default_db_path(os.environ)
 DAY_BOUNDARY_TZ = os.environ.get("TEMPORAL_ENGINE_TZ", "UTC")
 REFRESH_SECONDS = float(os.environ.get("TEMPORAL_ENGINE_REFRESH_SECONDS", "5"))
 
@@ -52,6 +61,11 @@ AGENT_MIN_INTERVAL = float(os.environ.get("TEMPORAL_ENGINE_AGENT_MIN_INTERVAL", 
 
 @asynccontextmanager
 async def lifespan(server: "MCPServer[Runtime]") -> AsyncIterator[Runtime]:
+    if "TEMPORAL_ENGINE_TZ" not in os.environ:
+        logging.getLogger("temporal_engine").warning(
+            "TEMPORAL_ENGINE_TZ is not set; day boundaries (NEW_DAY) use UTC. Set it to your IANA "
+            "timezone, e.g. Asia/Kolkata, or 'a new day' will start at the wrong local time."
+        )
     runtime = Runtime(DB_PATH, day_boundary_tz=DAY_BOUNDARY_TZ, refresh_interval=REFRESH_SECONDS)
     provider = provider_from_env(os.environ)  # raises with a clear message on misconfiguration
     if provider is not None:
@@ -435,5 +449,10 @@ async def reject_action(ctx: Context, idempotency_key: str) -> dict[str, Any]:
     return {"outcome": events[0].payload["outcome"], "idempotency_key": idempotency_key}
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console-script entry point: `temporal-engine-mcp`."""
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

@@ -192,6 +192,10 @@ The realistic deployment is two MCP clients (e.g. Claude Desktop and Claude Code
 - the day tracker is seeded from the log (last `NEW_DAY`, else the day the log began), so a handover neither repeats nor drops a `NEW_DAY`; it is reset after any failed pass;
 - **Stale-lock recovery.** The lock file records the holder's PID. A graceful close releases it; a force-kill leaves it behind, so a lock whose PID is dead (or whose file is empty/corrupt) is reclaimed. Liveness on Windows uses `OpenProcess`/`GetExitCodeProcess` — `os.kill(pid, 0)` must not be used there, as Windows treats any signal but CTRL_C/CTRL_BREAK as "terminate the process". A reused PID makes a dead holder look alive; this fails safe (no duplicate scheduler).
 
+### Where the database lives
+
+`TEMPORAL_ENGINE_DB` if set, otherwise `~/.temporal-engine/temporal_engine.db` (the folder is created if missing). The default was originally a *relative* path, which meant Claude Desktop, Claude Code and a terminal — each starting the server in a different working directory — would each silently get a separate database, defeating the multi-client design. Clients that should share state must resolve to the same file; an explicit setting is still the clearest way. If `TEMPORAL_ENGINE_TZ` is unset the server warns on stderr at startup, because the default (`UTC`) puts "a new day" at the wrong local time for almost everyone.
+
 ### Failure is visible, never silent
 
 A failed scheduling pass is logged to stderr (stdout is the MCP channel), recorded in `health` and reported by `get_temporal_context`, and retried with exponential backoff. The loop never dies. (Previously one uncaught `TypeError` killed it while `is_scheduler_process` kept saying true.)

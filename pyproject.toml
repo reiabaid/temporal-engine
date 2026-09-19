@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "temporal-engine"
+version = "0.1.0"
+description = "Deterministic, model-agnostic temporal state for AI agents, served over MCP."
+readme = "README.md"
+# 3.11 for datetime.fromisoformat's full ISO 8601 parsing. Developed and
+# tested on 3.12 only.
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2,<3",
+    "tzdata",            # IANA zone data; Windows and slim containers have none
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic"]
+openai = ["openai"]
+dev = ["pytest", "hypothesis"]
+
+[project.scripts]
+temporal-engine-mcp = "temporal_engine.mcp_server:main"
+
+[tool.setuptools.packages.find]
+include = ["temporal_engine*"]
