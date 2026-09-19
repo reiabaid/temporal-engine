@@ -83,6 +83,18 @@ def test_tick_ignores_terminal_tasks_entirely():
     assert events == []
 
 
+def test_day_tracker_seeded_from_persisted_date_reports_a_boundary_crossed_while_down():
+    from datetime import date
+
+    tracker = DayTracker(last_seen_date=date(2026, 9, 12))  # last activity before shutdown
+    after_restart = datetime(2026, 9, 15, 8, 0, tzinfo=UTC)  # three days later
+
+    events = tracker.check(after_restart, "UTC")
+
+    assert len(events) == 1
+    assert events[0].payload == {"previous_date": "2026-09-12", "new_date": "2026-09-15"}
+
+
 def test_day_tracker_fires_new_day_exactly_once_per_crossing():
     tracker = DayTracker()
     day1_evening = datetime(2026, 9, 12, 23, 0, tzinfo=UTC)

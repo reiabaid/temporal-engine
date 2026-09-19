@@ -77,11 +77,12 @@ The `occurred_at` / `recorded_at` split (bitemporal: valid time vs. transaction 
 ActionCall {
     idempotency_key: str          # caller-generated; same key = same action, applied once
     action: str                   # "complete_task" | "reschedule_task" |
-                                   # "carry_forward_task" | "cancel_task" | "ask_user"
+                                   # "carry_forward_task" | "cancel_task"
     task_id: str | None
     args: dict
     reason: str                   # LLM's stated justification, logged, not executed
-    requires_confirmation: bool   # true => must be surfaced to a human before applying
+    requires_confirmation: bool   # INTENT: true => hold for a human before applying.
+                                   # NOT ENFORCED YET -- see §5 "Human-in-the-loop".
 }
 ```
 
@@ -120,9 +121,17 @@ This exists even for rejected proposals — it's the record used to debug a bad 
 
 Each mutator is a thin wrapper that calls the state-machine validator (§1) before writing an event — none of them write state directly.
 
-### DRAFT
+`reschedule_task` and `carry_forward_task` return both the superseded `task` and a `new_task` summary. The new id is required to act on the task again (it supersedes rather than mutates), and was originally omitted — found by reasoning about what a model calling these tools actually needs, and fixed.
 
-- `ask_user(question, task_id | None)` — the primitive itself is uncontroversial, but its **transport** is not standardized: does the call block until a human answers, return a `PENDING` status the client polls, or map to MCP's elicitation feature (unsupported in most clients as of this writing)? This is intentionally left open until Phase 3's real-client test settles it — see §6.
+### Human-in-the-loop — DECIDED: no `ask_user` tool (design decision, not yet implemented)
+
+The v0.1 draft listed `ask_user(question)` as a primitive. **Decision: it is removed as a server-side tool.** Reasons:
+
+- The agent already has a channel to the human: the conversation it is running in. A server tool that "asks" adds nothing the model can't do by asking in chat.
+- A tool that blocks until a human answers hangs the MCP request; MCP elicitation depends on client support that can't be assumed; a "pending, please poll" tool is just a worse version of the next option.
+- What the *server* legitimately owns is not the asking but the **hold**: an action a model must not take unilaterally should be recorded but not applied until a human confirms. That is `requires_confirmation` on `ActionCall`, resolved by a `confirm_action(idempotency_key)` / `reject_action(idempotency_key)` pair. It is non-blocking, works in every MCP client (pull-based, like §6's stable path), and survives restarts because pending state lives in the event log (`ACTION_PROPOSED` with `outcome: "pending_confirmation"`).
+
+**Status: not built.** `requires_confirmation` is currently stored in the decision log but `apply_action` does not act on it — a flag that does nothing is a hazard, so this stays listed as a known gap until a real consumer needs it (Phase 4/5).
 
 ---
 
@@ -130,7 +139,8 @@ Each mutator is a thin wrapper that calls the state-machine validator (§1) befo
 
 - **Engine → itself (scheduler wake-up): STABLE.** `next_wake_time()` is a pure computation over task boundaries and the next local-midnight; the process holding the scheduler lock (see storage model, §7) sleeps exactly until that instant. No polling.
 - **Engine → LLM, pull (`get_temporal_context` on the next call): STABLE.** Works regardless of what any given MCP client supports, since it's a normal request/response call. This is the mechanism "what happened while I was away" actually relies on.
-- **Engine → human, push (server-initiated MCP notifications / sampling): DRAFT.** MCP notifications are not reliably surfaced by clients today, and the "sampling" callback is a server→model mechanism, not server→human. Do not build a feature that assumes a human is proactively notified the instant an event fires until Phase 3's real-client test confirms what the attached client actually does with one.
+- **Engine → human, push: DRAFT — and the only real-client observation so far is negative.** The server does not currently send any MCP notification, so this tested "does the session learn of a boundary event without asking," not "does the client render a notification." In Claude Code, a task was created and the session left idle across the task's entire window; nothing surfaced until `get_temporal_context` was called, at which point the state was already correct (`WINDOW_ENDED`, with `occurred_at` timestamps matching the scheduled boundaries to the second). Conclusion for design: **treat pull as the only reliable channel.** Whether MCP server-initiated notifications render in any client remains untested; do not build features that assume a human is proactively notified. The "sampling" callback is a server→model mechanism, not server→human, and doesn't change this.
+- **Engine → LLM after downtime: STABLE, and verified.** If the host app (and with it the server process) is closed while boundaries pass, the next start ticks immediately and catches up every missed transition before serving requests; the next `get_temporal_context` reflects real current state. `NEW_DAY` is likewise recovered across downtime (the day tracker is seeded from the last recorded event's date; if several days elapsed, one `NEW_DAY` is emitted with previous/new dates in its payload rather than one per day). **No events are generated *while* the app is closed** — there is no background daemon in this architecture; the state is corrected on the next start, not in real time.
 
 ---
 
@@ -140,6 +150,7 @@ Each mutator is a thin wrapper that calls the state-machine validator (§1) befo
 - Every `Task` carries a `display_timezone` (IANA name, e.g. `Asia/Kolkata`), used only for rendering and for computing the local-midnight boundary that drives `NEW_DAY`.
 - DST is handled by never comparing or constructing datetimes in a way that lands on an ambiguous or nonexistent local hour when it can be avoided — see `timezone_practice.py`'s `dst_status()` for the pattern (compare midnight-to-midnight rather than probing the transition hour directly). Recurring tasks whose rule collides with a DST transition (e.g., a daily 2:30am task on a spring-forward day) are DEFERRED — genuinely gnarly, low-frequency, not worth designing before Phase 5.
 - Exactly one process may run the scheduler loop against a given database at a time, enforced by an exclusive lock (`BEGIN IMMEDIATE` or an OS-level file lock) acquired at startup. Every other process attached to the same database is a read-only request handler. This exists because the realistic deployment is two MCP client processes (e.g. Claude Desktop and Claude Code) pointed at the same server config — WAL mode alone permits concurrent readers but does not prevent two processes each independently ticking the scheduler and firing duplicate events.
+- **Stale-lock recovery.** The lock file records the holder's PID. A graceful client close releases the lock (verified); a force-kill leaves it behind. On acquire, a lock whose PID is no longer alive (or whose file is empty/corrupt) is reclaimed. Liveness uses `OpenProcess`/`GetExitCodeProcess` on Windows — `os.kill(pid, 0)` must not be used there, since Windows treats any signal other than CTRL_C/CTRL_BREAK as an instruction to terminate the process. Known limitation: a reused PID makes a dead holder look alive; this fails safe (no duplicate scheduler). A process that cannot acquire the lock serves tools but does not tick, and reports `is_scheduler_process: false` in `get_temporal_context` so the condition is visible rather than silent.
 
 ---
 
@@ -147,11 +158,25 @@ Each mutator is a thin wrapper that calls the state-machine validator (§1) befo
 
 Carried forward explicitly rather than resolved by assumption:
 
-1. `ask_user` transport (§5) — **still open.** No `ask_user` tool exists in `mcp_server.py` yet; the six other primitives (including the new `create_task`) were built and verified first. Needs a decision before it's implemented, not after.
+1. ~~`ask_user` transport (§5)~~ — **resolved by decision:** the tool is dropped; human-in-the-loop becomes a `requires_confirmation` hold with `confirm_action`/`reject_action`. The hold itself is **not yet built** (tracked as a known gap in §5).
 2. Action schema shape (§3) — expect revision in Phase 4, once a second LLM provider's native tool-calling shape is tested against it.
-3. Push notification support (§6) — **partially resolved.** Pull-via-`get_temporal_context` is now STABLE and verified for real: a scripted MCP `ClientSession` over stdio created a task, and the scheduler loop (running in the same process, per the Phase 1 architecture decision) correctly woke early and ticked it through `ACTIVE` → `WINDOW_ENDED` in real time — proving the wake-event mechanism, not just the pull-query. What's *not* yet verified: whether an actual interactive client (Claude Desktop or Claude Code, not a scripted session) does anything useful with a server-initiated push, since none was attempted. That verification needs a human at the actual app, not something a script can stand in for.
+3. Push notification support (§6) — **resolved for design purposes, untested in the strict sense.** Pull is the only channel treated as reliable. Verified in the real client (Claude Code, live session): task created, session idle across its whole window, nothing surfaced unprompted, and a later pull returned correct state with exact boundary timestamps. Not tested: whether any client renders a server-initiated MCP notification, because the server sends none.
 4. Recurrence × DST collision (§7) — deferred to Phase 5.
+5. `requires_confirmation` is recorded but unenforced (§3/§5) — deferred to Phase 4/5.
+6. Real-client testing was done in Claude Code only. Claude Desktop (the separate app) was not tested; its config is a different file and its behavior on server lifecycle is unverified.
 
-## Bug found and fixed during Phase 3's real-client test
+## Bugs found and fixed during Phase 3
+
+Each was found by running the real server, not by reading the code, and each has a permanent regression test in `tests/test_mcp_integration.py` or `tests/test_lock.py`.
+
+**1. No catch-up after downtime (the most serious).** The scheduler loop computed `next_wake_time()` and slept, never ticking on startup. Because `next_wake_time` only considers boundaries still in the future, a task whose whole window elapsed while the host app was closed had no future boundary left, so the loop slept until midnight and the task read `SCHEDULED` long after it should have read `WINDOW_ENDED`. `tick()` itself was correct (Phase 1 tested catch-up directly); the loop that calls it was not. This was initially asserted to work without having tested it through the server — a test written afterwards reproduced the failure (`SCHEDULED` where `WINDOW_ENDED` was expected). Fixed by ticking at the top of every loop pass, before computing the sleep.
+
+**2. `NEW_DAY` lost across downtime.** `DayTracker` held its last-seen date only in memory, so after a restart its first call recorded a baseline and reported nothing. Fixed by seeding it from the most recent event's date.
+
+**3. Stale lock demoted the server silently.** See §7, "Stale-lock recovery."
+
+**4. `reschedule_task` / `carry_forward_task` didn't return the new task's id.** See §5.
+
+**5. Stale sleep.** (original entry, below)
 
 The scheduler loop originally computed its sleep duration once per iteration (`asyncio.sleep(delay)`). A task created with a near-term boundary while the loop was already asleep toward a distant target (e.g. tonight's midnight, computed against an empty task list at startup) would not be ticked until that stale target arrived — a real violation of "event-driven, no stale waits" that only surfaced by actually running the server and creating a task against it, not from reading the code. Fixed with a `wake_event` (`asyncio.Event`) that every task-mutating tool sets, and the scheduler now `asyncio.wait_for`s on it with the computed delay as a timeout — woken early, it recomputes; timed out naturally, it ticks. Verified live: a task scheduled 3 seconds out, created while the loop was asleep toward midnight, correctly transitioned `SCHEDULED` → `ACTIVE` → `WINDOW_ENDED` within the expected few seconds.

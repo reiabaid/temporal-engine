@@ -26,8 +26,13 @@ class DayTracker:
     caller owns and passes in, the same way SimulatedClock's internal
     `_now` is owned by the clock instance, not global."""
 
-    def __init__(self) -> None:
-        self._last_seen_date: Optional[date] = None
+    def __init__(self, last_seen_date: Optional[date] = None) -> None:
+        # Seed this from persisted state on restart. Starting empty means
+        # the first check() only records a baseline and reports nothing,
+        # so a day boundary crossed while the process was down would be
+        # silently lost. If several days elapsed, one NEW_DAY is emitted
+        # whose payload carries the previous and new dates.
+        self._last_seen_date: Optional[date] = last_seen_date
 
     def check(self, now: datetime, day_boundary_tz: str) -> list[TemporalEvent]:
         local_date = now.astimezone(ZoneInfo(day_boundary_tz)).date()

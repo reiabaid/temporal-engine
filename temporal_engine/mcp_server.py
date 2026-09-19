@@ -28,11 +28,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from mcp.server.mcpserver import Context, MCPServer
 
 from temporal_engine.actions import ActionCall, apply_action
 from temporal_engine.engine import DayTracker, tick
+from temporal_engine.events import EventType
 from temporal_engine.lock import SchedulerLock, SchedulerLockHeld
 from temporal_engine.scheduler import RealClock, next_wake_time
 from temporal_engine.storage import all_events, append_event, init_db, replay, task_created_event
@@ -92,30 +94,45 @@ async def lifespan(server: "MCPServer[AppState]") -> AsyncIterator[AppState]:
         conn.close()
 
 
+def _last_recorded_local_date(state: AppState):
+    """The local date of the most recent thing this database recorded --
+    i.e. the last day the engine is known to have been aware of."""
+    events = all_events(state.conn)
+    if not events:
+        return None
+    return events[-1].recorded_at.astimezone(ZoneInfo(DAY_BOUNDARY_TZ)).date()
+
+
 async def _scheduler_loop(state: AppState) -> None:
     """The event-driven core, unchanged in spirit from PLAN.md's Phase 1:
     compute the next meaningful instant, sleep exactly until then, tick,
     repeat. No fixed-interval polling anywhere."""
-    day_tracker = DayTracker()
+    day_tracker = DayTracker(last_seen_date=_last_recorded_local_date(state))
     while True:
+        # Cleared BEFORE ticking/computing, so a tool that sets it while
+        # we're mid-iteration isn't lost -- the wait below returns at once.
+        state.wake_event.clear()
+
+        # Tick first, sleep second. next_wake_time only looks at
+        # boundaries still in the future, so on startup after downtime
+        # (the host app was closed while a task's window elapsed) the
+        # overdue boundaries would be invisible to it and never ticked.
+        # tick() is idempotent and chains through every missed boundary,
+        # so ticking unconditionally at the top of each pass is safe.
+        for event in tick(state.tasks.values(), state.clock.now(), day_tracker,
+                          day_boundary_tz=DAY_BOUNDARY_TZ):
+            append_event(state.conn, event)
+
         now = state.clock.now()
         wake = next_wake_time(state.tasks.values(), now, day_boundary_tz=DAY_BOUNDARY_TZ)
-        delay = max((wake - now).total_seconds(), 0)
-
-        state.wake_event.clear()
         try:
-            await asyncio.wait_for(state.wake_event.wait(), timeout=delay)
-            # Woken early by a tool that changed `tasks` -- loop back and
-            # recompute next_wake_time against the new state rather than
-            # ticking on a boundary that's no longer the right one.
-            continue
+            await asyncio.wait_for(
+                state.wake_event.wait(), timeout=max((wake - now).total_seconds(), 0)
+            )
+            # Woken early because a tool changed `tasks`; loop back and
+            # recompute rather than trusting the now-stale target.
         except asyncio.TimeoutError:
-            pass  # the wake boundary was reached naturally; proceed to tick
-
-        now = state.clock.now()
-        events = tick(state.tasks.values(), now, day_tracker, day_boundary_tz=DAY_BOUNDARY_TZ)
-        for event in events:
-            append_event(state.conn, event)
+            pass  # boundary reached naturally; loop back and tick
 
 
 mcp = MCPServer("temporal-engine", lifespan=lifespan)
@@ -187,10 +204,16 @@ def _run_action(state: AppState, action: str, task_id: str, args: dict, reason: 
     state.wake_event.set()  # tasks may have changed shape (new task, new status)
 
     decision = events[0]
+    # reschedule/carry_forward supersede the task with a brand-new one;
+    # the caller needs that new id to act on it again (e.g. to complete
+    # it), and would otherwise need a separate get_temporal_context call.
+    created = [e for e in events if e.event_type == EventType.TASK_CREATED]
+    new_task = state.tasks.get(created[0].task_id) if created else None
     return {
         "outcome": decision.payload["outcome"],
         "rejection_reason": decision.payload.get("rejection_reason"),
         "task": _task_summary(state.tasks[task_id]) if task_id in state.tasks else None,
+        "new_task": _task_summary(new_task) if new_task else None,
     }
 
 
