@@ -74,6 +74,10 @@ class Runtime:
         self.refresh_interval = refresh_interval
         self.health = Health()
         self.wake_event = asyncio.Event()
+        # Set after a scheduler pass records events, so the agent loop reacts
+        # when something happens instead of only on its poll interval.
+        self.new_events = asyncio.Event()
+        self.agent = None  # set by the host if an Agent is enabled
 
         db_path = Path(db_path)
         self.store = Store(str(db_path))
@@ -110,6 +114,7 @@ class Runtime:
                     self.store.append(events)
                 if events:
                     self.health.last_tick_at = now
+                    self.new_events.set()
         except BaseException:
             # The tracker may have advanced past a NEW_DAY that was never
             # persisted; forget it so it is re-seeded from the log.

@@ -29,6 +29,11 @@ class EventType(str, Enum):
     # A fact reported by the user/agent (work actually began), not a status
     # change -- the clock-derived ACTIVE status only means the window opened.
     TASK_WORK_STARTED = "TASK_WORK_STARTED"
+    # The agent loop's durable bookmark: "every trigger event up to
+    # payload.through_seq has been handled". Lives in the log so a restart
+    # resumes where it left off instead of re-deciding (and re-paying for)
+    # old events, and so a handover between processes agrees on the cursor.
+    AGENT_CHECKPOINT = "AGENT_CHECKPOINT"
 
 
 SCHEMA_VERSION = 1

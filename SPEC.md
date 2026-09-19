@@ -77,7 +77,7 @@ TemporalEvent {
 }
 ```
 
-`EventType`: `TASK_CREATED`, `TASK_STARTED`, `TASK_WINDOW_ENDED`, `TASK_DEADLINE_BREACHED`, `TASK_COMPLETED`, `TASK_RESCHEDULED`, `TASK_CARRIED_FORWARD`, `TASK_DROPPED`, `TASK_CANCELLED`, `TASK_WORK_STARTED`, `NEW_DAY`, `ACTION_PROPOSED`.
+`EventType`: `TASK_CREATED`, `TASK_STARTED`, `TASK_WINDOW_ENDED`, `TASK_DEADLINE_BREACHED`, `TASK_COMPLETED`, `TASK_RESCHEDULED`, `TASK_CARRIED_FORWARD`, `TASK_DROPPED`, `TASK_CANCELLED`, `TASK_WORK_STARTED`, `NEW_DAY`, `ACTION_PROPOSED`, `AGENT_CHECKPOINT` (§8).
 
 - `TASK_CREATED` carries a full snapshot of the task (needed so replay can rebuild it from the log alone) plus the `idempotency_key` of the action that created it, if any.
 - **Valid vs transaction time.** `TASK_STARTED` etc. are stamped with the boundary they represent (`occurred_at = scheduled_start`), and `recorded_at` is when the engine noticed. `NEW_DAY.occurred_at` is the local midnight of the new day, *not* the moment of detection — after downtime those differ by hours or days, and "when did the day change" must not depend on when the app was reopened.
@@ -212,17 +212,39 @@ At most 3 moves (reschedule/carry-forward) of one task lineage within 24 hours. 
 
 ---
 
+## 8. The agent loop — built, OFF by default, never run against a real model
+
+The design's original spine — scheduler event -> agent invocation -> LLM reasoning -> action — with no human in the loop. Without it the engine only *detects*; the model acts when someone talks to it. It is enabled by `TEMPORAL_ENGINE_PROVIDER` (`stub` | `anthropic` | `openai`; plus `TEMPORAL_ENGINE_MODEL`, `TEMPORAL_ENGINE_BASE_URL`, `TEMPORAL_ENGINE_AGENT_MIN_INTERVAL`) because it makes paid API calls unattended. `get_temporal_context` reports its status (`agent`), so it is never invisible.
+
+**What it reacts to.** Only `TASK_WINDOW_ENDED`, `TASK_DEADLINE_BREACHED` and `NEW_DAY`. A task starting, or someone creating or completing something, needs no reasoning.
+
+**Not waking the model for nothing** (deterministic, before any API call): a trigger whose task has since finished is dropped (the user completed it after the window ended); `NEW_DAY` only counts if something is unfinished; a batch with nothing left never calls the provider.
+
+**At-most-once decisions, durably.**
+- `AGENT_CHECKPOINT {through_seq, batch_id, proposed, outcomes, note}` is a log event marking how far triggers have been handled. A restart resumes there; a handover to another process agrees on it; **enabling the agent on an existing log starts from now** rather than acting on history.
+- Idempotency keys are `agent:<batch_id>:<slot>`, derived from the triggering event ids, not from the vendor's tool-call ids. A crash *after applying but before checkpointing* re-decides the same batch — possibly differently — and lands on the same keys, so nothing applies twice (tested by mutating the derivation and watching the test fail). This closes the re-deciding gap noted in §3.
+
+**Bounded.** At most 10 actions per batch, at most one batch per 30 s (configurable), exponential backoff on provider errors **without** advancing the checkpoint (nothing is lost, and a failing API is not hammered), and every action still passes the validator, the move rate limit (§7) and the confirmation hold (§5) — a model-proposed cancel is held for a human. End-to-end in real processes: a one-second task that keeps ending is rescheduled three times and the fourth attempt is refused, after which the agent stops.
+
+**One runner.** Only the scheduler holder runs it; other processes return `not_scheduler`.
+
+**Threading.** SDK calls block for seconds, so the provider runs on a worker thread — but on a **private deep copy** of the tasks and events. Engine state is still touched only by the event-loop thread; a test hands the provider a context it vandalises and checks live state is unchanged.
+
+**Known limits.** Untested against any real model. The trigger set is fixed. Two batches within one interval are coalesced by waiting, not merged. Confirmation of held actions needs a human to call `confirm_action`/`reject_action`; nothing notifies them (§6).
+
+---
+
 ## Not done (explicit)
 
 - **Recurrence.** The `recurrence` field exists and nothing uses it. Needs an RRULE implementation and the DST-collision design. Phase 5.
 - **External calendars, multiple editing agents beyond the write-lock protocol, multi-user / multi-timezone.**
-- **No automatic agent loop.** The server does not itself call an `LLMProvider` when events fire: the model is the MCP *client*, and acts when someone talks to it. The provider layer (`decide` -> `apply_action`, including the confirmation hold) is library code exercised by tests and scripts; wiring it to `Runtime` so events trigger decisions unattended is unbuilt. Until then, held actions only arise if something routes provider output through `Runtime.execute`.
+- **The agent loop is built but only ever run against the stub.** It is off by default, and no real model has driven it (§8).
 - **Live model behaviour.** No live call to any LLM has been made; provider code is tested against fakes and the scenarios against a stub.
 - **Claude Desktop** (the separate app) was never tested; real-client testing was Claude Code only.
 - **Notifications** to a human: none sent; whether any client renders one is untested.
 - **Suspend/resume.** Detection lag after the machine sleeps is bounded by the refresh interval by design, but was not measured on real hardware.
 - **Directly-called `cancel_task` is not held** (§5), only model-proposed ones via the provider path.
-- **Idempotency does not cover re-deciding** (§3).
+- **Idempotency does not cover re-deciding for a human/client caller** (§3): the agent loop closes this gap for itself by deriving keys from events (§8), but a client that simply asks a model again gets new ids.
 - **Quarantined events are surfaced only as a count**; there is no tool to inspect or repair them.
 - **The move limit is actor-blind.**
 - **Prompt injection is mitigated, not solved** (§3).
@@ -248,6 +270,10 @@ Found by testing the running system, not by reading code. Each has a permanent r
 10. **No record of actual work start; overlaps unreported; injection unmitigated; confirmation hold unenforced.** Built (§1, §5, §3).
 11. **Scheduler handover:** the lock was tried once at startup, so a surviving client never took over. Fixed.
 12. `last_transition_at` differed between live and replayed tasks. Fixed and tested.
+
+### After v0.2 — the agent loop
+
+Verified the rewritten server in the real client first (validation, overlap reporting, work-start tracking, scheduler health and the `Asia/Kolkata` boundary all behaved as specified). Then built §8. A first version of the crash-recovery test passed even with the key derivation removed, because the test provider returned the same key every time; it now returns a fresh id per call, and fails against the mutant.
 
 ### Phase 3 (earlier)
 

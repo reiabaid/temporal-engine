@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
@@ -27,8 +28,10 @@ PROJECT_DIR = str(Path(__file__).resolve().parent.parent)
 
 
 @asynccontextmanager
-async def _session(db_path: Path, refresh_seconds: float = 5.0):
+async def _session(db_path: Path, refresh_seconds: float = 5.0, extra_env: dict | None = None):
     env = os.environ.copy()
+    env.pop("TEMPORAL_ENGINE_PROVIDER", None)   # the agent is off unless a test turns it on
+    env.update(extra_env or {})
     env["TEMPORAL_ENGINE_DB"] = str(db_path)
     env["TEMPORAL_ENGINE_REFRESH_SECONDS"] = str(refresh_seconds)
     env["PYTHONPATH"] = PROJECT_DIR
@@ -355,3 +358,55 @@ def test_reschedule_returns_new_task_id_and_cap_rejects_the_fourth_move(tmp_path
 
     # 3 moves allowed per 24h (DEFAULT_MAX_MOVES), the 4th refused
     assert asyncio.run(scenario()) == ["applied", "applied", "applied", "rejected"]
+
+
+# ------------------------------------------------------------------ the agent
+
+def test_the_agent_is_off_by_default(tmp_path):
+    async def scenario():
+        async with _session(tmp_path / "t.db") as s:
+            return (await _call(s, "get_temporal_context"))["agent"]
+
+    assert asyncio.run(scenario()) == {"enabled": False}
+
+
+def test_the_agent_acts_unattended_and_the_move_limit_stops_a_runaway(tmp_path):
+    """Events -> agent -> model -> action, with nobody talking to anything.
+    A one-second task keeps ending, so the (stub) model keeps rescheduling it:
+    the exact runaway the move limit exists for. Three moves are applied and
+    the fourth is refused -- proving the agent, the decision log and the
+    limit together, in real processes."""
+    if datetime.now(timezone.utc).hour >= 23:
+        pytest.skip("the stub carries forward instead of rescheduling near midnight UTC")
+
+    async def scenario():
+        env = {"TEMPORAL_ENGINE_PROVIDER": "stub", "TEMPORAL_ENGINE_AGENT_MIN_INTERVAL": "0"}
+        async with _session(tmp_path / "t.db", extra_env=env) as s:
+            await asyncio.sleep(1.0)                      # the agent takes its "start from now" bookmark
+            now = datetime.now(timezone.utc)
+            await _call(s, "create_task", {
+                "title": "flaps", "timezone": "UTC",
+                "scheduled_start": _iso(now + timedelta(seconds=1)),
+                "scheduled_end": _iso(now + timedelta(seconds=2)),
+            })
+            outcomes, ctx = [], None
+            for _ in range(40):
+                await asyncio.sleep(0.5)
+                ctx = await _call(s, "get_temporal_context", {"event_limit": 200})
+                outcomes = [
+                    e["detail"]["outcome"] for e in ctx["events"]
+                    if e["event_type"] == "ACTION_PROPOSED"
+                    and e["detail"]["action_call"]["idempotency_key"].startswith("agent:")
+                ]
+                if len(outcomes) >= 4:
+                    break
+            await asyncio.sleep(2)                        # and it must not carry on after being refused
+            final = await _call(s, "get_temporal_context", {"event_limit": 200})
+            return outcomes, ctx, final
+
+    outcomes, ctx, final = asyncio.run(scenario())
+    assert outcomes == ["applied", "applied", "applied", "rejected"]
+    later = [e for e in final["events"] if e["event_type"] == "ACTION_PROPOSED"
+             and e["detail"]["action_call"]["idempotency_key"].startswith("agent:")]
+    assert len(later) == 4                                # no further decisions after the refusal
+    assert final["agent"]["enabled"] is True and final["agent"]["last_error"] is None

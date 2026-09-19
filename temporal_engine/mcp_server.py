@@ -29,6 +29,7 @@ from typing import Any, Optional
 from mcp.server.mcpserver import Context, MCPServer
 
 from temporal_engine.actions import ActionCall, lenient_datetime
+from temporal_engine.agent import Agent, AgentConfig, provider_from_env
 from temporal_engine.events import EventType, TemporalEvent
 from temporal_engine.overlap import find_conflicts, find_overlapping
 from temporal_engine.runtime import Runtime
@@ -42,19 +43,31 @@ REFRESH_SECONDS = float(os.environ.get("TEMPORAL_ENGINE_REFRESH_SECONDS", "5"))
 
 MAX_FINISHED_TASKS = 50
 
+# The unattended agent loop is OFF unless TEMPORAL_ENGINE_PROVIDER is set
+# (stub | anthropic | openai): it makes paid API calls without anyone asking.
+AGENT_MIN_INTERVAL = float(os.environ.get("TEMPORAL_ENGINE_AGENT_MIN_INTERVAL", "30"))
+
 
 @asynccontextmanager
 async def lifespan(server: "MCPServer[Runtime]") -> AsyncIterator[Runtime]:
     runtime = Runtime(DB_PATH, day_boundary_tz=DAY_BOUNDARY_TZ, refresh_interval=REFRESH_SECONDS)
-    loop_task = asyncio.create_task(runtime.run_forever())
+    provider = provider_from_env(os.environ)  # raises with a clear message on misconfiguration
+    if provider is not None:
+        runtime.agent = Agent(runtime, provider, AgentConfig(min_interval_seconds=AGENT_MIN_INTERVAL))
+
+    loops = [asyncio.create_task(runtime.run_forever())]
+    if runtime.agent is not None:
+        loops.append(asyncio.create_task(runtime.agent.run_forever()))
     try:
         yield runtime
     finally:
-        loop_task.cancel()
-        try:
-            await loop_task
-        except asyncio.CancelledError:
-            pass
+        for loop_task in loops:
+            loop_task.cancel()
+        for loop_task in loops:
+            try:
+                await loop_task
+            except asyncio.CancelledError:
+                pass
         runtime.close()
 
 
@@ -182,6 +195,7 @@ async def get_temporal_context(
             "consecutive_errors": health.consecutive_errors,
         },
         "quarantined_events": len(view.quarantined),
+        "agent": runtime.agent.status() if runtime.agent else {"enabled": False},
         "tasks": [_task_summary(t, now) for t in active],
         "conflicts": [
             {"a": {"id": a.id, "title": a.title}, "b": {"id": b.id, "title": b.title}}

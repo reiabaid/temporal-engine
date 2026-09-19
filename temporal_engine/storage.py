@@ -143,6 +143,7 @@ def query_events(
     since_seq: Optional[int] = None,
     since_time: Optional[datetime] = None,
     task_ids: Optional[list[str]] = None,
+    event_types: Optional[list[EventType]] = None,
     limit: int = 20,
 ) -> tuple[list[TemporalEvent], bool]:
     """Events in ascending order plus whether more exist beyond `limit`.
@@ -161,6 +162,9 @@ def query_events(
     if task_ids:
         where.append(f"task_id IN ({','.join('?' * len(task_ids))})")
         params.extend(task_ids)
+    if event_types:
+        where.append(f"event_type IN ({','.join('?' * len(event_types))})")
+        params.extend(t.value for t in event_types)
     clause = f"WHERE {' AND '.join(where)}" if where else ""
 
     if since_seq is None and since_time is None:
@@ -190,6 +194,8 @@ class View:
     # answered with the original task instead of a duplicate.
     created_by_key: dict[str, str] = field(default_factory=dict)
     last_seq: int = 0
+    # How far the agent loop has processed trigger events (None = never run).
+    agent_cursor: Optional[int] = None
     last_new_day: Optional[date] = None
     first_event_at: Optional[datetime] = None
     quarantined: list[tuple[int, str]] = field(default_factory=list)
@@ -221,7 +227,7 @@ def _apply_to_tasks(tasks: dict[str, Task], event: TemporalEvent) -> None:
         )
         return
 
-    if kind in (EventType.NEW_DAY, EventType.ACTION_PROPOSED):
+    if kind in (EventType.NEW_DAY, EventType.ACTION_PROPOSED, EventType.AGENT_CHECKPOINT):
         return  # not about one task's status
 
     task = tasks[event.task_id]
@@ -261,6 +267,10 @@ def _index(view: View, event: TemporalEvent) -> None:
         key = event.payload.get("idempotency_key")
         if key:
             view.created_by_key[key] = event.task_id
+
+    elif event.event_type == EventType.AGENT_CHECKPOINT:
+        through = int(event.payload["through_seq"])
+        view.agent_cursor = through if view.agent_cursor is None else max(view.agent_cursor, through)
 
     elif event.event_type == EventType.ACTION_PROPOSED:
         call = event.payload.get("action_call", {})
