@@ -117,7 +117,7 @@ Task titles are text written by people (and, later, by calendar invites) that ge
 
 ### Decision fixtures (`temporal_engine/scenarios.py`)
 
-Each scenario encodes its correct decision as an assertion: an allowed-action set (empty = "correct answer is to do nothing"), enforced through the real deterministic layer (a proposal must be applied, or held, not merely well-formed), plus a per-scenario constraint. Restraint counts as correct. The same fixtures score the stub in CI (which also proves the scoring discriminates, by running deliberately wrong providers) and any live model by hand (`scripts/live_scenarios.py`). Four scenarios exist; the fuller list (deadlines, recurrence, dependencies, multi-day) is Phase 6.
+Each scenario encodes its correct decision as an assertion: an allowed-action set (empty = "correct answer is to do nothing"), enforced through the real deterministic layer (a proposal must be applied, or held, not merely well-formed), plus a per-scenario constraint. Restraint counts as correct. The same fixtures score the stub in CI (which also proves the scoring discriminates, by running deliberately wrong providers) and any live model by hand (`scripts/live_scenarios.py`). Four scenarios exist. A second, separate benchmark — **State-QA** (`temporal_engine/state_qa.py`, `BENCHMARK.md`) — tests the project's premise directly: can a model *derive* task statuses from a plain history? Its ground truth is produced by running the real engine, cross-checked by an independent oracle and, for daylight saving, by answers derived by hand. Harness and integrity checks are built; no real model has been scored.
 
 ---
 

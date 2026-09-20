@@ -97,9 +97,13 @@ Rationale, edge cases and the bugs found along the way are in [SPEC.md](SPEC.md)
 
 With `TEMPORAL_ENGINE_PROVIDER` set, the server reacts to *window ended*, *deadline breached* and *new day* events by asking a model what to do, with no one in the chat. **Off by default because it makes paid API calls unattended.** It skips events that need no decision, resumes where it left off after a restart, never applies a decision twice, is rate limited, and backs off on errors. `stub` runs a deterministic heuristic (no API, no cost) so you can watch it work. Details in [SPEC.md](SPEC.md) §8.
 
+## Benchmark
+
+[BENCHMARK.md](BENCHMARK.md) describes **State-QA**: given a plain-text history and the current time, can a model derive each task's status? Ground truth comes from running the real engine; scoring is exact match with confidence intervals; deliberately flawed reference solvers prove the benchmark tells error classes apart. **No real model has been scored yet**, and the document is explicit about what a score would and would not show.
+
 ## Known limitations
 
-- **No live LLM has driven the agent loop.** Providers are tested against fakes; decision quality is unmeasured. `scripts/live_scenarios.py` scores a real model on four fixtures once you supply a key.
+- **No real model has been scored on the benchmark**, and none has driven the agent loop. Providers are tested against fakes; decision quality is unmeasured. `scripts/live_scenarios.py` scores a real model on four fixtures once you supply a key.
 - **Claude Desktop is untested.** Only Claude Code has been driven for real.
 - **No notifications.** Nothing pushes to you; clients pull. Whether any client would render a server push is unknown.
 - **Nothing runs while the client is closed** (state is corrected on next start).
