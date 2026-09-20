@@ -42,16 +42,23 @@ def find_overlapping(
     return found
 
 
-def find_conflicts(tasks: Iterable[Task]) -> list[tuple[Task, Task]]:
-    """Every pair of unfinished tasks whose windows overlap."""
+def find_conflicts(tasks: Iterable[Task], limit: Optional[int] = None) -> list[tuple[Task, Task]]:
+    """Overlapping pairs of unfinished tasks, at most `limit` of them.
+    Unbounded, n mutually overlapping tasks make n(n-1)/2 pairs (1,500 tasks
+    is over a million), which a caller would then try to serialize -- so
+    callers that report conflicts must pass a limit."""
     windowed = sorted(
         ((t, w) for t in tasks if not t.is_terminal() and (w := _window(t)) is not None),
         key=lambda item: item[1][0],
     )
-    pairs = []
-    for i, (first, (_, first_end)) in enumerate(windowed):
-        for second, (second_start, _) in windowed[i + 1:]:
+    pairs: list[tuple[Task, Task]] = []
+    for i in range(len(windowed)):
+        first, (_, first_end) = windowed[i]
+        for j in range(i + 1, len(windowed)):
+            second, (second_start, _) = windowed[j]
             if second_start >= first_end:
                 break  # sorted by start: nothing later can overlap `first`
             pairs.append((first, second))
+            if limit is not None and len(pairs) >= limit:
+                return pairs
     return pairs

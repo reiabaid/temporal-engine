@@ -29,12 +29,13 @@ import json
 import logging
 import sqlite3
 from contextlib import contextmanager
+from pathlib import Path
 from dataclasses import dataclass, field
-from datetime import date, datetime
-from typing import Iterable, Iterator, Optional
+from datetime import date, datetime, timezone
+from typing import Callable, Iterable, Iterator, Optional
 from zoneinfo import ZoneInfo
 
-from temporal_engine.events import EventType, TemporalEvent
+from temporal_engine.events import SCHEMA_VERSION as EVENT_SCHEMA_VERSION, EventType, TemporalEvent
 from temporal_engine.recurrence import Recurrence
 from temporal_engine.task import Task, TaskStatus
 
@@ -54,9 +55,43 @@ CREATE TABLE IF NOT EXISTS events (
 """
 
 
+# The DATABASE layout version (PRAGMA user_version), separate from the per-event payload version carried in each
+# row. A layout change adds an entry to MIGRATIONS: {from_version: function(conn)} taking the database to
+# from_version + 1. Databases created before versioning existed report 0 and are stamped 1 (same layout).
+DB_SCHEMA_VERSION = 1
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {}
+
+
+class SchemaTooNew(RuntimeError):
+    """The database was written by a newer version of this software. Opening it could corrupt it."""
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.execute(_CREATE_EVENTS_TABLE)
-    conn.commit()
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version > DB_SCHEMA_VERSION:
+        raise SchemaTooNew(
+            f"this database has layout version {version} but this software only understands up to "
+            f"{DB_SCHEMA_VERSION}; upgrade temporal-engine (or open it with the version that wrote it)"
+        )
+    if version < 1:
+        version = 1
+        conn.execute("PRAGMA user_version = 1")
+    while version < DB_SCHEMA_VERSION:
+        migrate = MIGRATIONS.get(version)
+        if migrate is None:
+            raise RuntimeError(f"no migration from database layout version {version} to {version + 1}")
+        conn.execute("BEGIN IMMEDIATE")            # one migration = one atomic step, or nothing
+        try:
+            migrate(conn)
+            conn.execute(f"PRAGMA user_version = {version + 1}")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        version += 1
+    if conn.in_transaction:
+        conn.commit()
 
 
 # ---------------------------------------------------------------- writing
@@ -159,7 +194,7 @@ def query_events(
         params.append(since_seq)
     if since_time is not None:
         where.append("recorded_at >= ?")
-        params.append(since_time.isoformat())
+        params.append(since_time.astimezone(timezone.utc).isoformat())   # stored text is UTC; compare like with like
     if task_ids:
         where.append(f"task_id IN ({','.join('?' * len(task_ids))})")
         params.extend(task_ids)
@@ -233,6 +268,8 @@ def _apply_to_tasks(tasks: dict[str, Task], event: TemporalEvent) -> None:
             carried_from=p.get("carried_from"),
             recurrence_id=p.get("recurrence_id"),
             occurrence=p.get("occurrence"),
+            estimated_minutes=p.get("estimated_minutes"),
+            depends_on=tuple(p.get("depends_on") or ()),
         )
         return
 
@@ -314,6 +351,9 @@ def _index(view: View, event: TemporalEvent) -> None:
 
 
 def apply_event(view: View, event: TemporalEvent) -> None:
+    if event.schema_version > EVENT_SCHEMA_VERSION:
+        # Written by a newer version whose payload we may misread: skip (quarantine) rather than guess.
+        raise ValueError(f"event has schema_version {event.schema_version}; this software understands {EVENT_SCHEMA_VERSION}")
     _apply_to_tasks(view.tasks, event)
     _index(view, event)
 
@@ -332,6 +372,21 @@ def refresh_view(conn: sqlite3.Connection, view: View, strict: bool = False) -> 
             view.quarantined.append((seq, reason))
             log.warning("quarantined event seq=%s (%s)", seq, reason)
         view.last_seq = seq
+
+
+def view_as_of(conn: sqlite3.Connection, at: datetime) -> View:
+    """The view built from only the events the system had RECORDED by `at`: what it knew then. Bad events are
+    skipped exactly as they are when a Store loads. This is the bitemporal payoff of keeping both
+    occurred_at and recorded_at."""
+    view = View()
+    for row in _select(conn, "SELECT * FROM events ORDER BY seq ASC"):
+        try:
+            event = _row_to_event(row)
+            if event.recorded_at <= at:
+                apply_event(view, event)
+        except (ValueError, KeyError, TypeError):
+            continue
+    return view
 
 
 def replay(conn: sqlite3.Connection, quarantine: Optional[list] = None) -> dict[str, Task]:
@@ -415,8 +470,102 @@ class Store:
     def events(self, **kwargs) -> tuple[list[TemporalEvent], bool]:
         return query_events(self.conn, **kwargs)
 
+    def count_creations_since(self, since: datetime) -> int:
+        """Tasks made by create_task calls (from anyone) recorded at or after `since`. Moves and recurrence
+        occurrences are not counted: they are bounded by other rules."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM events WHERE event_type = ? AND recorded_at >= ? "
+            "AND json_extract(payload, '$.idempotency_key') IS NOT NULL",
+            (EventType.TASK_CREATED.value, since.astimezone(timezone.utc).isoformat()),
+        ).fetchone()
+        return row[0]
+
+    def backup(self, destination: str | Path) -> None:
+        backup_database(self.conn, destination)
+
+    def export_jsonl(self, destination: str | Path) -> int:
+        return export_jsonl(self.conn, destination)
+
     def close(self) -> None:
         self.conn.close()
+
+
+# ------------------------------------------------------- backup and export
+
+def backup_database(conn: sqlite3.Connection, destination: str | Path) -> None:
+    """A consistent copy of the whole database, taken while it is in use (SQLite's online backup API), refusing
+    to overwrite an existing file. A backup you can silently clobber is a way to lose the one you had."""
+    dest = Path(destination)
+    if dest.exists():
+        raise FileExistsError(f"{dest} already exists; choose a new file")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    target = sqlite3.connect(str(dest))
+    try:
+        conn.backup(target)
+    finally:
+        target.close()
+
+
+def export_jsonl(conn: sqlite3.Connection, destination: str | Path) -> int:
+    """The log as one JSON object per line, in order, seq included: readable anywhere, diffable, and enough to
+    rebuild the database (import_jsonl). Returns the number of events written."""
+    dest = Path(destination)
+    if dest.exists():
+        raise FileExistsError(f"{dest} already exists; choose a new file")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    count = 0
+    with open(dest, "w", encoding="utf-8", newline="\n") as out:
+        for row in _select(conn, "SELECT * FROM events ORDER BY seq ASC"):
+            out.write(json.dumps({
+                "seq": row["seq"], "id": row["id"], "schema_version": row["schema_version"],
+                "event_type": row["event_type"], "occurred_at": row["occurred_at"],
+                "recorded_at": row["recorded_at"], "task_id": row["task_id"],
+                "payload": json.loads(row["payload"]),
+            }, separators=(",", ":")) + "\n")
+            count += 1
+    return count
+
+
+_IMPORT_FIELDS = ("seq", "id", "schema_version", "event_type", "occurred_at", "recorded_at", "task_id", "payload")
+
+
+def import_jsonl(conn: sqlite3.Connection, source: str | Path) -> int:
+    """Rebuild an EMPTY database from an export. All-or-nothing: any malformed line aborts the whole import and
+    leaves the database untouched. seq is preserved, because agent checkpoints refer to it."""
+    if _select(conn, "SELECT 1 FROM events LIMIT 1"):
+        raise ValueError("refusing to import into a database that already has events")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        count, previous = 0, 0
+        with open(source, "r", encoding="utf-8") as handle:
+            for number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                    missing = [f for f in _IMPORT_FIELDS if f not in record]
+                    if missing:
+                        raise ValueError(f"missing {missing}")
+                    EventType(record["event_type"])
+                    datetime.fromisoformat(record["occurred_at"])
+                    datetime.fromisoformat(record["recorded_at"])
+                    if not isinstance(record["seq"], int) or record["seq"] <= previous:
+                        raise ValueError("seq must increase")
+                    previous = record["seq"]
+                    conn.execute(
+                        "INSERT INTO events (seq, id, schema_version, event_type, occurred_at, recorded_at, task_id, payload) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (record["seq"], record["id"], record["schema_version"], record["event_type"],
+                         record["occurred_at"], record["recorded_at"], record["task_id"], json.dumps(record["payload"])),
+                    )
+                except (ValueError, TypeError, sqlite3.Error) as exc:
+                    raise ValueError(f"{source}:{number}: cannot import ({exc})") from exc
+                count += 1
+        conn.execute("COMMIT")
+        return count
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def task_created_event(task: Task, at: datetime, idempotency_key: Optional[str] = None) -> TemporalEvent:
@@ -434,6 +583,10 @@ def task_created_event(task: Task, at: datetime, idempotency_key: Optional[str] 
     if task.recurrence_id:
         payload["recurrence_id"] = task.recurrence_id
         payload["occurrence"] = task.occurrence
+    if task.estimated_minutes is not None:
+        payload["estimated_minutes"] = task.estimated_minutes
+    if task.depends_on:
+        payload["depends_on"] = list(task.depends_on)
     if idempotency_key:
         payload["idempotency_key"] = idempotency_key
     return TemporalEvent(

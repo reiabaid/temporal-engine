@@ -35,6 +35,8 @@ Expected: `WINDOW_ENDED`, `ACTIVE`, `SCHEDULED`. (09:00 is EST = 14:00Z on the 7
 | `completions` | Done early, in-window, late, past a deadline inside the window; cancelled; ignored. |
 | `moves` | A rescheduled or carried-forward task is asked about by its *newest* version. |
 | `local_midnight` | The time is given in UTC only, minutes after **local** midnight, where the UTC and local dates disagree. |
+| `historical` | "What was the status at 4pm yesterday?" The history runs past the question time; completions, cancellations and moves that happen afterwards must not leak into the answer. Truth is the engine's `state_as_of`. |
+| `dependencies` | BLOCKED or not: an unfinished dependency, a finished one, one that was moved (still unfinished) or moved and then finished, a cancelled one, and one of two. BLOCKED is worked out from the script independently, and the engine's own report must agree at generation time. |
 | `dst_recurrence` | Recurring tasks in six cases built on real 2026 daylight-saving transitions in the US, UK and Australia, including a skipped and a repeated local hour. Fixed, hand-built, not random. |
 
 ## Why you can trust the ground truth
@@ -43,13 +45,15 @@ Expected: `WINDOW_ENDED`, `ACTIVE`, `SCHEDULED`. (09:00 is EST = 14:00Z on the 7
 - **The DST answers are derived by hand**, from the real transition dates, independently of the engine (`test_the_dst_cases_match_answers_derived_by_hand...`). They were checked against the engine after being written, and a mutation that resolved a skipped local time the wrong way failed them.
 - **The benchmark discriminates.** Programs with one deliberate flaw each must fail exactly the categories the flaw predicts and pass the rest:
 
-| solver (not a model) | window_states | deadlines | completions | moves | local_midnight | dst_recurrence | all |
-|---|---|---|---|---|---|---|---|
-| engine (reference) | 40/40 | 60/60 | 60/60 | 40/40 | 30/30 | 36/36 | 100% |
-| ignores deadlines | 40/40 | 30/60 | 50/60 | 40/40 | 30/30 | 36/36 | 85% |
-| forgets to convert offsets | 18/40 | 38/60 | 57/60 | 27/40 | 10/30 | 24/36 | 65% |
-| reads clock digits, not instants | 40/40 | 60/60 | 60/60 | 40/40 | 30/30 | 34/36 | 99% |
-| assumes a fixed UTC offset | 40/40 | 60/60 | 60/60 | 40/40 | 30/30 | 28/36 | 97% |
+| solver (not a model) | window_states | deadlines | completions | moves | local_midnight | dst_recurrence | historical | dependencies | all |
+|---|---|---|---|---|---|---|---|---|---|
+| engine (reference) | 40/40 | 60/60 | 60/60 | 40/40 | 30/30 | 36/36 | 50/50 | 60/60 | 100% |
+| ignores deadlines | 40/40 | 30/60 | 50/60 | 40/40 | 30/30 | 36/36 | 50/50 | 60/60 | 89% |
+| forgets to convert offsets | 18/40 | 38/60 | 57/60 | 27/40 | 10/30 | 24/36 | 32/50 | 36/60 | 64% |
+| reads clock digits, not instants | 40/40 | 60/60 | 60/60 | 40/40 | 30/30 | 34/36 | 50/50 | 60/60 | 99% |
+| assumes a fixed UTC offset | 40/40 | 60/60 | 60/60 | 40/40 | 30/30 | 28/36 | 50/50 | 60/60 | 98% |
+| ignores dependencies | 40/40 | 60/60 | 60/60 | 40/40 | 30/30 | 36/36 | 50/50 | 30/60 | 92% |
+| answers for the present, not the question time | 40/40 | 60/60 | 60/60 | 40/40 | 30/30 | 36/36 | 10/50 | 60/60 | 89% |
 
 (Seeds 0 and 1, 5 cases per category; the DST category is fixed, so here it repeats across seeds. `scripts/live_state_qa.py` dedupes it.) Notably, reading clock digits looks nearly perfect. The realistic daylight-saving mistake is assuming the offset never changes, and *that* one needs a dedicated probe.
 

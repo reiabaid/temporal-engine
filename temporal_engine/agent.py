@@ -60,6 +60,8 @@ class AgentConfig:
     min_interval_seconds: float = 30.0
     poll_seconds: float = 5.0
     max_calls_per_batch: int = 10
+    max_context_tasks: int = 100     # bounds the prompt (and the bill) however many tasks exist
+    max_creations_per_day: int = 30  # tasks the agent may create in 24h: a runaway model must not fill the log
     batch_limit: int = 50
     backoff_base_seconds: float = 5.0
     backoff_max_seconds: float = 300.0
@@ -115,10 +117,19 @@ class Agent:
         self.last_error = None
 
         outcomes = []
+        creations_left = self._creation_budget(now)
         for index, call in enumerate(calls[: self.config.max_calls_per_batch]):
             # Derived from the triggering events + slot, so re-deciding this
             # batch after a crash lands on the same keys.
             call.idempotency_key = f"agent:{batch_id}:{index}"
+            call.caused_by = tuple(e.id for e in relevant)
+            if call.action == "create_task":
+                if not call.args.get("display_timezone"):
+                    call.args["display_timezone"] = rt.day_boundary_tz
+                if creations_left <= 0:
+                    outcomes.append(rt.reject(call, "the agent's daily task-creation limit was reached")[0].payload["outcome"])
+                    continue
+                creations_left -= 1
             outcomes.append(rt.execute(call)[0].payload["outcome"])
 
         note = f"truncated {len(calls)} to {self.config.max_calls_per_batch}" if len(calls) > self.config.max_calls_per_batch else ""
@@ -173,11 +184,21 @@ class Agent:
         """A private deep copy: the provider runs on a worker thread, and
         must not be able to observe or mutate live engine state."""
         unfinished: list[Task] = [t for t in view.tasks.values() if not t.is_terminal()]
+        wanted = {e.task_id for e in relevant}
+
+        def nearness(t: Task) -> float:
+            return abs(((t.scheduled_start or t.deadline or now) - now).total_seconds())
+
+        # The tasks the events are about always go in; the rest nearest-to-now first, up to the cap.
+        chosen = [t for t in unfinished if t.id in wanted]
+        others = sorted((t for t in unfinished if t.id not in wanted), key=nearness)
+        chosen += others[: max(0, self.config.max_context_tasks - len(chosen))]
         return TemporalContext(
             now=now,
             events=copy.deepcopy(relevant),
-            tasks=copy.deepcopy(unfinished),
+            tasks=copy.deepcopy(chosen),
             timezone=self.runtime.day_boundary_tz,
+            omitted_tasks=len(unfinished) - len(chosen),
         )
 
     def _checkpoint(self, through_seq: int, batch_id: str, proposed: int, outcomes: list, note: str = "") -> None:
@@ -189,6 +210,20 @@ class Agent:
                 payload={"through_seq": through_seq, "batch_id": batch_id,
                          "proposed": proposed, "outcomes": outcomes, "note": note},
             )])
+
+    def _creation_budget(self, now: datetime) -> int:
+        """How many more tasks the agent may create in the last-24h window, counted from the log so the
+        limit survives restarts."""
+        events, _ = self.runtime.store.events(
+            since_time=now - timedelta(hours=24), event_types=[EventType.ACTION_PROPOSED], limit=1000,
+        )
+        used = sum(
+            1 for e in events
+            if e.payload.get("outcome") == "applied"
+            and e.payload["action_call"]["idempotency_key"].startswith("agent:")
+            and e.payload["action_call"]["action"] == "create_task"
+        )
+        return max(0, self.config.max_creations_per_day - used)
 
     def _fail(self, exc: BaseException, now: datetime) -> None:
         self._failures += 1

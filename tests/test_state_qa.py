@@ -178,3 +178,55 @@ def test_assuming_a_fixed_utc_offset_fails_exactly_the_dst_cases_and_nothing_els
     dst_cases = [c for c in CASES if c.category == "dst_recurrence"]
     wrong_cases = [c for c in dst_cases if AssumesFixedOffset().solve(c) != c.expected]
     assert len(wrong_cases) >= 3                                # several regions, not an edge quirk
+
+
+# ------------------------------------------- historical and dependency categories
+
+from collections import Counter
+
+from temporal_engine.state_qa import AnswersForThePresent, IgnoresDependencies
+
+
+def test_historical_cases_ask_about_the_past_and_the_history_runs_past_the_question():
+    for case in (c for c in CASES if c.category == "historical"):
+        assert case.present is not None and case.present > case.now
+        assert any(s.at > case.now for s in case.steps)                       # later events exist, and must be ignored
+        prompt = render_prompt(case)
+        assert "Question time" in prompt and "EARLIER moment" in prompt
+    counts = Counter(v for c in CASES if c.category == "historical" for v in c.expected.values())
+    assert {"ACTIVE", "WINDOW_ENDED", "SCHEDULED", "COMPLETED"} <= set(counts)   # not one status repeated
+
+
+def test_dependency_cases_cover_blocked_and_every_way_of_not_being_blocked():
+    counts = Counter(v for c in CASES if c.category == "dependencies" for v in c.expected.values())
+    assert counts["BLOCKED"] > 0 and counts["ACTIVE"] > 0 and counts["WINDOW_ENDED"] > 0
+    for case in (c for c in CASES if c.category == "dependencies"):
+        prompt = render_prompt(case)
+        assert "depends on" in prompt and "BLOCKED" in prompt
+
+
+def test_the_dependency_and_historical_notes_appear_only_where_they_apply():
+    for case in CASES:
+        prompt = render_prompt(case)
+        assert ("BLOCKED" in prompt) == (case.category == "dependencies")
+        assert ("EARLIER moment" in prompt) == (case.category == "historical")
+
+
+def test_ignoring_dependencies_fails_exactly_the_dependency_category():
+    report = score(IgnoresDependencies())
+    for category in CATEGORIES:
+        cat = report.by_category[category]
+        if category == "dependencies":
+            assert cat.tasks_correct < cat.tasks
+        else:
+            assert cat.tasks_correct == cat.tasks, category
+
+
+def test_answering_for_the_present_fails_exactly_the_historical_category():
+    report = score(AnswersForThePresent())
+    for category in CATEGORIES:
+        cat = report.by_category[category]
+        if category == "historical":
+            assert cat.tasks_correct < cat.tasks
+        else:
+            assert cat.tasks_correct == cat.tasks, category

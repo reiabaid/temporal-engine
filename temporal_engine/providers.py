@@ -33,6 +33,8 @@ class TemporalContext:
     # UTC, and says nothing about what "today", "midnight" or "9am" mean to
     # the person -- this does.
     timezone: str = "UTC"
+    # Unfinished tasks left out of `tasks` to bound the prompt (they cost money and dilute attention).
+    omitted_tasks: int = 0
 
 
 class LLMProvider(Protocol):
@@ -58,6 +60,7 @@ class StubHeuristicLLM:
     def decide(self, ctx: TemporalContext) -> list[ActionCall]:
         actions: list[ActionCall] = []
         tasks_by_id = {t.id: t for t in ctx.tasks}
+        handled: set[str] = set()
         for event in ctx.events:
             if event.event_type != EventType.TASK_WINDOW_ENDED:
                 continue
@@ -67,7 +70,10 @@ class StubHeuristicLLM:
             task = tasks_by_id.get(event.task_id)
             if task is None or task.is_terminal():
                 continue
+            handled.add(task.id)
             actions.append(self._handle_window_ended(ctx, event))
+        if any(e.event_type == EventType.NEW_DAY for e in ctx.events):
+            actions.extend(self._handle_new_day(ctx, handled))
         return actions
 
     def _handle_window_ended(self, ctx: TemporalContext, event: TemporalEvent) -> ActionCall:
@@ -126,3 +132,31 @@ class StubHeuristicLLM:
                 args={"new_start": tomorrow_9am, "new_end": tomorrow_9am + duration},
                 reason="No slack left today; carrying forward to tomorrow's plan.",
             )
+
+    def _handle_new_day(self, ctx: TemporalContext, handled: set[str]) -> list[ActionCall]:
+        """Yesterday's unfinished work is carried forward to today, stacked from 09:00 (or now, if it is later)
+        in the order it was originally due. Tasks whose deadline would already have passed are left alone:
+        extending a deadline is a human's decision, not a heuristic's."""
+        utc, local = timezone.utc, ZoneInfo(ctx.timezone)
+        now = ctx.now.astimezone(utc)
+        today = now.astimezone(local).date()
+        cursor = max(now, datetime.combine(today, time(9, 0), tzinfo=local).astimezone(utc))
+
+        stale = sorted(
+            (t for t in ctx.tasks
+             if t.id not in handled and t.status == TaskStatus.WINDOW_ENDED
+             and t.scheduled_start and t.scheduled_end and t.scheduled_end.astimezone(local).date() < today),
+            key=lambda t: t.scheduled_end,
+        )
+        actions = []
+        for task in stale:
+            duration = task.scheduled_end.astimezone(utc) - task.scheduled_start.astimezone(utc)
+            if task.deadline and cursor >= task.deadline.astimezone(utc):
+                continue
+            actions.append(ActionCall(
+                idempotency_key=str(uuid.uuid4()), action="carry_forward_task", task_id=task.id,
+                args={"new_start": cursor, "new_end": cursor + duration},
+                reason=f"'{task.title}' was not finished yesterday; carrying it into today's plan.",
+            ))
+            cursor += duration
+        return actions

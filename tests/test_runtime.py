@@ -147,7 +147,7 @@ def test_new_day_is_recovered_after_downtime_with_the_real_midnight(env):
     b = env.make()
     b.run_pass()
     (day,) = [e for e in b.store.events(limit=50)[0] if e.event_type.value == "NEW_DAY"]
-    assert day.payload == {"previous_date": "2026-09-12", "new_date": "2026-09-15"}
+    assert (day.payload["previous_date"], day.payload["new_date"]) == ("2026-09-12", "2026-09-15")
     assert day.occurred_at == datetime(2026, 9, 15, 0, 0, tzinfo=UTC)
 
 

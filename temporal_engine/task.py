@@ -15,6 +15,11 @@ from enum import Enum
 from typing import Optional
 from zoneinfo import ZoneInfo
 
+# Input is untrusted and lands in the append-only log and in every response, so it is bounded.
+MAX_TITLE_LENGTH = 500
+MAX_ESTIMATE_MINUTES = 7 * 24 * 60
+MAX_DEPENDENCIES = 20
+
 
 class TaskStatus(str, Enum):
     CREATED = "CREATED"
@@ -150,6 +155,24 @@ def validate_schedule(
         )
 
 
+def validate_planning(estimated_minutes: object, depends_on: object) -> tuple[Optional[int], tuple[str, ...]]:
+    """Validate the two planning fields and return them normalised. Untrusted input, like everything else."""
+    if estimated_minutes is not None:
+        if isinstance(estimated_minutes, bool) or not isinstance(estimated_minutes, int):
+            raise ValueError(f"estimated_minutes must be a whole number of minutes, got {estimated_minutes!r}")
+        if not 1 <= estimated_minutes <= MAX_ESTIMATE_MINUTES:
+            raise ValueError(f"estimated_minutes must be between 1 and {MAX_ESTIMATE_MINUTES}, got {estimated_minutes}")
+    if depends_on is None:
+        depends_on = ()
+    if isinstance(depends_on, str) or not isinstance(depends_on, (list, tuple)):
+        raise ValueError(f"depends_on must be a list of task ids, got {depends_on!r}")
+    if len(depends_on) > MAX_DEPENDENCIES:
+        raise ValueError(f"depends_on has {len(depends_on)} entries; the limit is {MAX_DEPENDENCIES}")
+    if not all(isinstance(d, str) and d for d in depends_on):
+        raise ValueError("depends_on entries must be non-empty task id strings")
+    return estimated_minutes, tuple(dict.fromkeys(depends_on))     # de-duplicated, order kept
+
+
 @dataclass
 class Task:
     id: str
@@ -169,6 +192,10 @@ class Task:
     # When work actually began, as told to us -- distinct from the
     # clock-derived ACTIVE status, which only means the window opened.
     actual_start: Optional[datetime] = None
+    # How long the person expects it to take (minutes), and the tasks that should be finished first. Both are
+    # facts the caller supplied; what follows from them (at risk, blocked) is derived in planning.py.
+    estimated_minutes: Optional[int] = None
+    depends_on: tuple[str, ...] = ()
 
     @staticmethod
     def new(
@@ -177,14 +204,19 @@ class Task:
         scheduled_start: Optional[datetime] = None,
         scheduled_end: Optional[datetime] = None,
         deadline: Optional[datetime] = None,
+        estimated_minutes: Optional[int] = None,
+        depends_on: Optional[list[str]] = None,
     ) -> "Task":
         if not isinstance(title, str) or not title.strip():
             raise ValueError("title must be a non-empty string")
+        if len(title) > MAX_TITLE_LENGTH:
+            raise ValueError(f"title is too long ({len(title)} characters; the limit is {MAX_TITLE_LENGTH})")
         try:
             ZoneInfo(display_timezone)
         except (KeyError, ValueError, TypeError) as exc:
             raise ValueError(f"unknown timezone {display_timezone!r} (expected an IANA name)") from exc
         validate_schedule(scheduled_start, scheduled_end, deadline)
+        estimated_minutes, depends_on = validate_planning(estimated_minutes, depends_on)
 
         status = TaskStatus.SCHEDULED if scheduled_start else TaskStatus.CREATED
         return Task(
@@ -195,6 +227,8 @@ class Task:
             scheduled_end=scheduled_end,
             deadline=deadline,
             status=status,
+            estimated_minutes=estimated_minutes,
+            depends_on=depends_on,
         )
 
     def is_terminal(self) -> bool:

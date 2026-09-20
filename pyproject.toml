@@ -27,6 +27,7 @@ dev = ["pytest", "hypothesis"]
 
 [project.scripts]
 temporal-engine-mcp = "temporal_engine.mcp_server:main"
+temporal-engine = "temporal_engine.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["temporal_engine*"]

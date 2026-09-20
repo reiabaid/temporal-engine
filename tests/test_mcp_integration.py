@@ -442,3 +442,35 @@ def test_recurring_tasks_over_mcp(tmp_path):
     assert ended["outcome"] == "applied" and ended["recurrence"]["ended"] is True
     assert after["recurrences"] == [] and len(after["tasks"]) == 8            # stopped, but nothing already made was touched
     assert [r["ended"] for r in with_ended["recurrences"]] == [True]
+
+
+# ---------------------------------------------------- planning and calendar tools
+
+def test_dependencies_estimates_and_calendar_import_over_the_real_protocol(tmp_path):
+    ics = ("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:e1\r\nSUMMARY:Board meeting\r\n"
+           "DTSTART:20990101T100000Z\r\nDTEND:20990101T110000Z\r\nEND:VEVENT\r\n"
+           "BEGIN:VEVENT\r\nUID:e2\r\nSUMMARY:Holiday\r\nDTSTART;VALUE=DATE:20990102\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
+
+    async def scenario():
+        async with _session(tmp_path / "plan.db") as s:
+            base = await _call(s, "create_task", {"title": "Write deck", "timezone": "UTC", "estimated_minutes": 90})
+            base_id = base["new_task"]["id"]
+            assert base["new_task"]["estimated_minutes"] == 90
+            dep = await _call(s, "create_task", {"title": "Present", "timezone": "UTC", "depends_on": [base_id]})
+            assert dep["new_task"]["is_blocked"] is True and dep["new_task"]["blocked_by"] == [base_id]
+
+            bad = await _call(s, "create_task", {"title": "x", "timezone": "UTC", "depends_on": ["missing"]})
+            assert bad["outcome"] == "rejected"
+
+            first = await _call(s, "import_calendar", {"ics": ics, "source": "work"})
+            assert (first["created"], first["skipped"]) == (1, 1) and first["skipped_events"][0]["reason"] == "all-day event"
+            again = await _call(s, "import_calendar", {"ics": ics, "source": "work"})
+            assert (again["created"], again["unchanged"]) == (0, 1)
+
+            await _call(s, "complete_task", {"task_id": base_id})
+            ctx = await _call(s, "get_temporal_context")
+            present = next(t for t in ctx["tasks"] if t["title"] == "Present")
+            assert present["is_blocked"] is False
+            assert ctx["scheduler"]["clock_regressions"] == 0
+
+    asyncio.run(scenario())

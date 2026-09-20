@@ -81,6 +81,8 @@ TemporalEvent {
 
 - `TASK_CREATED` carries a full snapshot of the task (needed so replay can rebuild it from the log alone) plus the `idempotency_key` of the action that created it, if any.
 - **Valid vs transaction time.** `TASK_STARTED` etc. are stamped with the boundary they represent (`occurred_at = scheduled_start`), and `recorded_at` is when the engine noticed. `NEW_DAY.occurred_at` is the local midnight of the new day, *not* the moment of detection — after downtime those differ by hours or days, and "when did the day change" must not depend on when the app was reopened.
+- **`NEW_DAY` is forward-only.** Its payload is `{previous_date, new_date, timezone}`. If the configured timezone moves west or the system clock steps back so the local date is earlier than the last announced one, nothing is emitted until the date passes it.
+- **Causality.** An `ACTION_PROPOSED` decision carries `caused_by` (ids of the events that triggered it, for agent decisions), and every event a mutator writes for an action carries `action_key` (the action's idempotency key). Trigger -> decision -> effect can be walked from the log alone.
 - A task's `last_transition_at` is the event's `recorded_at`, in both the live path and replay, so a live task and its replayed copy agree (tested).
 - `schema_version` exists because the log is append-only and cannot be edited in place.
 
@@ -152,6 +154,7 @@ All tools are `async` (§7, Threading). Mutating tools take an optional `idempot
 | `create_recurring_task(title, timezone, frequency, start_time, ...)`, `end_recurring_task(recurrence_id)` | Recurring tasks (§9). |
 | `list_pending_actions()`, `confirm_action(key)`, `reject_action(key)` | The confirmation hold. |
 | `get_temporal_context(since_seq?, since?, event_limit?, include_finished?)` | See below. |
+| `get_state_as_of(at, include_finished?)` | Status of every task as of `at` (needs a UTC offset). Built from what had been recorded by then, with time-derived states brought forward; a future `at` is a projection (`is_projection`). |
 
 **`get_temporal_context`** returns: `now`, `day_boundary_timezone`, `is_scheduler_process`, `scheduler` health (`last_pass_at`, `last_tick_at`, `last_error`, `consecutive_errors`), unfinished `tasks` (with `worked_seconds` where started), `conflicts` (overlapping pairs), `pending_actions`, `events`, `events_truncated`, `cursor`, and `quarantined_events` (a count). To learn what happened while away, pass the previous `cursor` as `since_seq` (or an ISO time as `since`): newer events only, oldest first, never skipping. `include_finished` adds recently finished tasks (last 50), so "what did I finish?" is answerable; without it, finished tasks are omitted. It refreshes from the log first, so it reflects other processes' writes.
 
@@ -196,6 +199,20 @@ The realistic deployment is two MCP clients (e.g. Claude Desktop and Claude Code
 
 `TEMPORAL_ENGINE_DB` if set, otherwise `~/.temporal-engine/temporal_engine.db` (the folder is created if missing). The default was originally a *relative* path, which meant Claude Desktop, Claude Code and a terminal — each starting the server in a different working directory — would each silently get a separate database, defeating the multi-client design. Clients that should share state must resolve to the same file; an explicit setting is still the clearest way. If `TEMPORAL_ENGINE_TZ` is unset the server warns on stderr at startup, because the default (`UTC`) puts "a new day" at the wrong local time for almost everyone.
 
+### Bounds: nothing unbounded goes in, out, or into a paid API
+
+Found by trying to break the newer code (see the change log). Input and output are bounded, and every limit is applied to *new* input only — replaying the log never re-checks it, so a limit introduced later can never make recorded data unreadable.
+
+- **In.** Titles ≤ 500 characters; a new recurrence's `first_date` within ~5 years of today; `idempotency_key` ≤ 200 characters at the MCP boundary. The **decision log clips** what it records: any argument string over 1,000 characters is cut and marked, and so are error messages that echo a value (an append-only log can never be trimmed afterwards, so a rejected 5 MB argument must not be written whole). An action held for confirmation is stored whole or not at all — oversized ones are rejected rather than clipped, since a clipped hold would corrupt what a later `confirm_action` applies.
+- **Out.** `get_temporal_context` lists at most 500 tasks (nearest to now first, with `tasks_total` / `tasks_truncated`), 50 conflicts (`conflicts_truncated`; unbounded, n mutually overlapping tasks make n(n−1)/2 pairs — over a million for 1,500 — that the call would then try to serialize), and 100 pending actions and recurrences.
+- **Into a model.** The agent's prompt carries at most `max_context_tasks` (default 100) unfinished tasks — always those the triggering events are about, then nearest to now — and says how many were left out. Every task in the context is sent to a paid API.
+- **Creation.** Every caller shares one limit: 1000 tasks made by `create_task` (including calendar imports) per rolling 24 hours (`Runtime(max_creations_per_day=...)`), refused as a logged rejection with the reason. A retried call with an already-applied key is recognised first, so it is `superseded`, not refused. Moves and recurrence occurrences are bounded by their own rules and not counted. The agent has its own, tighter daily budget (§8).
+- **Recurrence expansion** that would exceed its safety cap now *raises* instead of silently truncating: a truncated expansion stops short of the present and quietly generates nothing, on every pass, forever.
+
+### One failure must not spread
+
+A broken recurring template (or anything that makes one template's generation raise) is isolated: each template is generated atomically — nothing reaches memory unless the whole template succeeded — the failure is recorded in `scheduler.recurrence_errors` (logged once per distinct message, cleared when it recovers), and every other template *and every task's tick* carries on. Previously a single failure aborted the whole pass, so an unrelated task could stay `SCHEDULED` past its window. Creating a template that cannot be generated is refused and rolled back; a *different* healthy template can still be created while another is broken.
+
 ### Failure is visible, never silent
 
 A failed scheduling pass is logged to stderr (stdout is the MCP channel), recorded in `health` and reported by `get_temporal_context`, and retried with exponential backoff. The loop never dies. (Previously one uncaught `TypeError` killed it while `is_scheduler_process` kept saying true.)
@@ -236,9 +253,18 @@ The design's original spine — scheduler event -> agent invocation -> LLM reaso
 
 **Threading.** SDK calls block for seconds, so the provider runs on a worker thread — but on a **private deep copy** of the tasks and events. Engine state is still touched only by the event-loop thread; a test hands the provider a context it vandalises and checks live state is unchanged.
 
+**The agent can build a plan.** `create_task` is in the provider's action enum (`new_start`/`new_end` map to the window). The agent fills in `display_timezone` from the engine's timezone when omitted, and creations are capped per day (`max_creations_per_day`, default 30), counted from the decision log so the budget survives restarts; over-budget calls are logged as `rejected`. The reference policy also handles `NEW_DAY` by carrying yesterday's unfinished work into today from 09:00 local, stacked without overlap.
+
 **Known limits.** Untested against any real model. The trigger set is fixed. Two batches within one interval are coalesced by waiting, not merged. Confirmation of held actions needs a human to call `confirm_action`/`reject_action`; nothing notifies them (§6).
 
 ---
+
+## 7a. Operating the database
+
+- **Layout versioning.** `PRAGMA user_version` holds the database layout version (`DB_SCHEMA_VERSION`, now 1); `MIGRATIONS` maps `n -> function` taking a database from `n` to `n+1`, each run in its own transaction (a failing step leaves no trace). A database from a NEWER version is refused with `SchemaTooNew` rather than opened and possibly corrupted. Databases created before versioning report 0 and are adopted as 1 (identical layout). Separately, each *event* carries its payload `schema_version`; an event newer than the software understands is quarantined, not misread.
+- **Backup and export.** `backup` uses SQLite's online backup API (consistent while in use) and never overwrites; `export` writes the log as JSON lines including `seq`; `import` rebuilds an EMPTY database all-or-nothing and preserves `seq`, because agent checkpoints refer to it. The round trip is tested to reproduce every event exactly.
+- **Clock trust.** The engine cannot know whether the clock or the world is right, so it does not guess: a backward step of more than 5 seconds is counted in `scheduler.clock_regressions` with a `last_clock_warning`, and `NEW_DAY` is forward-only regardless (§2), so a step back cannot re-announce a day.
+- **Headless and notifications.** `temporal-engine run` runs the scheduler (and agent) with no AI client; `temporal-engine watch` prints events that need a human (window ended, deadline, new day, task start, action held for confirmation) and can run a user-supplied command per event, passing the event through environment variables (task titles are untrusted and never reach the command line).
 
 ## 9. Recurring tasks
 
@@ -256,25 +282,48 @@ A recurring task is a **template** that generates ordinary tasks. The template (
 
 ---
 
+## 10. Planning facts and calendar import
+
+**Estimates and dependencies.** `Task.estimated_minutes` (1 to 10080) and `Task.depends_on` (up to 20 ids of tasks that ALREADY exist, which also makes cycles impossible) are supplied facts, carried by `TASK_CREATED`, kept across reschedules, and validated at the boundary. `planning.py` derives from them, never raising events or refusing anything: `estimate_exceeds_window`, `remaining_estimate_minutes`, `over_estimate`, `projected_finish` and `at_risk_of_missing_deadline` (arithmetic, not prediction); `is_blocked` / `blocked_by` / `abandoned` / `scheduled_before_dependency`. A dependency is judged by the head of its lineage (a moved dependency is followed to its replacement); completed (even late) satisfies it; dropped or cancelled is reported as `abandoned` and does not block. A blocked task can still be completed: out-of-order work is normal, and refusing it would be the engine overreaching (the same stance as overlaps).
+
+**Calendar import** (`calendar_import.py`, tool `import_calendar`). Pull-only and text-only: the caller passes the text of an `.ics` export, so there are no credentials and no network surface. Identity is `(source, UID)`. Same file again: nothing. Changed time: `reschedule_task` keyed on the head being moved (so a calendar that flaps A, B, A is followed, while a crash-retry is idempotent). `STATUS:CANCELLED`: `cancel_task`. A task finished or removed locally is never reopened: the local decision wins. Skipped with a reason, never guessed: all-day events, no end time, recurring events (RRULE, RECURRENCE-ID), unknown TZIDs. Times are normalised to UTC on the way in. Two calendars overlapping are reported by the existing conflict detection, which does not pick a winner. Bounds: 1,000,000 characters, 500 events, source names `[A-Za-z0-9_.-]{1,40}`. Not handled: title changes on an existing event, live sync, attendees, alarms.
+
+---
+
 ## Not done (explicit)
 
 - **Recurrence is a deliberate subset** (§9): daily/weekly/monthly with interval, weekdays, days of month, `until`/`count`. No iCalendar RRULE strings, no yearly, no "nth weekday of the month", no exception dates (skip an occurrence by cancelling it), no per-series deadlines, and a template cannot be edited (end it and create a new one). The 7-day generation horizon and 24-hour catch-up lookback are fixed constants.
-- **External calendars, multiple editing agents beyond the write-lock protocol, multi-user / multi-timezone.**
+- **Live calendar sync, multiple editing agents beyond the write-lock protocol, multi-user / multi-timezone.** Calendar import (§10) is one-way, manual and text-only.
 - **The agent loop is built but only ever run against the stub.** It is off by default, and no real model has driven it (§8).
 - **Live model behaviour.** No live call to any LLM has been made; provider code is tested against fakes and the scenarios against a stub.
 - **Claude Desktop** (the separate app) was never tested; real-client testing was Claude Code only.
-- **Notifications** to a human: none sent; whether any client renders one is untested.
+- **Push notifications from the engine itself.** `temporal-engine watch --exec` (§7a) is the hook; whether any AI client renders a server push is untested.
 - **Suspend/resume.** Detection lag after the machine sleeps is bounded by the refresh interval by design, but was not measured on real hardware.
 - **Directly-called `cancel_task` is not held** (§5), only model-proposed ones via the provider path.
 - **Idempotency does not cover re-deciding for a human/client caller** (§3): the agent loop closes this gap for itself by deriving keys from events (§8), but a client that simply asks a model again gets new ids.
 - **Quarantined events are surfaced only as a count**; there is no tool to inspect or repair them.
 - **The move limit is actor-blind.**
+- **Durations are a single estimate**, not a distribution or a learned model; nothing predicts overruns beyond the arithmetic in §10.
+- **No schema migration has ever been needed**, so the migration machinery (§7a) is tested with synthetic migrations only.
+- **The creation limit is a rate limit, not a size limit.** Nothing caps total log size or task count.
 - **Prompt injection is mitigated, not solved** (§3).
 - **PID reuse** can make a dead lock holder look alive (fails safe).
 
 ---
 
 ## Change log
+
+### After v0.2 — finishing pass (closing the audit's gaps)
+
+Built: estimates and dependencies (§10); calendar import (§10); database layout versioning and newer-event quarantine, backup/export/import (§7a); a creation limit shared by every caller (§7); clock-regression visibility (§7a); the `temporal-engine` CLI with headless `run` and notification-hook `watch` (§7a); two more State-QA categories, `historical` and `dependencies`, each with a flawed solver that must fail exactly that category. Every new protection was mutation-checked (removing it fails a test). Deliberately NOT done, and stated in "Not done": any run against a real model, Claude Desktop, live calendar sync, multi-user.
+
+### After v0.2 — third audit (the whole system against the original brief)
+
+See [AUDIT.md](AUDIT.md) for the traceability matrix. Fixes: `NEW_DAY` forward-only with the timezone in its payload; event causality (`caused_by`, `action_key`); the agent can `create_task` with a per-day cap; `get_state_as_of` / `Runtime.state_as_of` answer "what was true at time T" for the past and project the future from the clock alone (property-tested against live snapshots); the reference policy handles `NEW_DAY`. New acceptance test replays the brief's day story end to end.
+
+### After v0.2 — second audit (of the newer code)
+
+Method as before: try to break it, believe only what reproduces. Four suspicions, four confirmed: (1) one broken recurring template made the whole scheduler pass fail, freezing every task's tick; (2) an absurd `first_date` was accepted, produced *zero* occurrences (the expansion cap silently truncated before the present) and burned ~0.5 s of CPU on every 5-second pass; (3) a 5 MB title was accepted; (4) 1,500 overlapping tasks make 1.1 million conflict pairs that `get_temporal_context` would serialize. The same unbounded-output problem existed in the agent's prompt. The regression tests then found a hole the first fix missed: a *rejected* oversized call still wrote its entire argument into the log (mutation-checked: without the clipping, its test fails; likewise for isolation and the cap). Two of my own tests asserted nothing (`... or True`) and were replaced — a habit worth naming.
 
 ### v0.1 → v0.2 — the audit
 

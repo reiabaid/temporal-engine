@@ -92,7 +92,8 @@ def test_day_tracker_seeded_from_persisted_date_reports_a_boundary_crossed_while
     events = tracker.check(after_restart, "UTC")
 
     assert len(events) == 1
-    assert events[0].payload == {"previous_date": "2026-09-12", "new_date": "2026-09-15"}
+    assert {k: events[0].payload[k] for k in ("previous_date", "new_date")} == {"previous_date": "2026-09-12", "new_date": "2026-09-15"}
+    assert events[0].payload["timezone"] == "UTC"
 
 
 def test_day_tracker_fires_new_day_exactly_once_per_crossing():

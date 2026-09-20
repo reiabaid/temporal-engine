@@ -42,7 +42,11 @@ class DayTracker:
             self._last_seen_date = local_date
             return []
 
-        if local_date == self._last_seen_date:
+        if local_date <= self._last_seen_date:
+            # Equal: already announced. EARLIER: the timezone setting moved west (the user travelled) or the
+            # system clock stepped back. Announcing a day earlier than one already announced would be a
+            # NEW_DAY that goes backwards -- and would wake the agent for nothing -- so stay quiet until
+            # the local date actually passes the last announced one.
             return []
 
         event = TemporalEvent(
@@ -55,6 +59,7 @@ class DayTracker:
             payload={
                 "previous_date": self._last_seen_date.isoformat(),
                 "new_date": local_date.isoformat(),
+                "timezone": day_boundary_tz,
             },
         )
         self._last_seen_date = local_date

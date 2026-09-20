@@ -32,8 +32,10 @@ from mcp.server.mcpserver import Context, MCPServer
 
 from temporal_engine.actions import ActionCall, lenient_datetime
 from temporal_engine.agent import Agent, AgentConfig, provider_from_env
+from temporal_engine.calendar_import import import_calendar as _import_calendar
 from temporal_engine.events import EventType, TemporalEvent
 from temporal_engine.overlap import find_conflicts, find_overlapping
+from temporal_engine.planning import planning_report
 from temporal_engine.recurrence import Recurrence, next_occurrences
 from temporal_engine.runtime import Runtime
 from temporal_engine.task import Task
@@ -53,6 +55,12 @@ DAY_BOUNDARY_TZ = os.environ.get("TEMPORAL_ENGINE_TZ", "UTC")
 REFRESH_SECONDS = float(os.environ.get("TEMPORAL_ENGINE_REFRESH_SECONDS", "5"))
 
 MAX_FINISHED_TASKS = 50
+# Responses are bounded: unbounded lists let a runaway client (or a bug) make a single call unservably large.
+MAX_LISTED_TASKS = 500
+MAX_LISTED_CONFLICTS = 50
+MAX_LISTED_OTHER = 100
+MAX_KEY_LENGTH = 200
+MAX_REASON_LENGTH = 2000
 
 # The unattended agent loop is OFF unless TEMPORAL_ENGINE_PROVIDER is set
 # (stub | anthropic | openai): it makes paid API calls without anyone asking.
@@ -96,7 +104,7 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
     return dt.isoformat() if dt else None
 
 
-def _task_summary(task: Task, now: datetime) -> dict[str, Any]:
+def _task_summary(task: Task, now: datetime, tasks: Optional[dict[str, Task]] = None) -> dict[str, Any]:
     summary = {
         "id": task.id,
         "title": task.title,
@@ -115,6 +123,8 @@ def _task_summary(task: Task, now: datetime) -> dict[str, Any]:
         # rather than leaving it to the model.
         end = task.last_transition_at if task.is_terminal() and task.last_transition_at else now
         summary["worked_seconds"] = max(0, int((end - task.actual_start).total_seconds()))
+    # Estimate and dependency consequences are arithmetic on facts the caller gave, so the server does them.
+    summary.update(planning_report(tasks if tasks is not None else {task.id: task}, task, now))
     return summary
 
 
@@ -158,8 +168,8 @@ def _result(runtime: Runtime, call: ActionCall, events: list[TemporalEvent]) -> 
         "outcome": decision.payload["outcome"],
         "rejection_reason": decision.payload.get("rejection_reason"),
         "idempotency_key": call.idempotency_key,
-        "task": _task_summary(task, now) if task else None,
-        "new_task": _task_summary(new_task, now) if new_task else None,
+        "task": _task_summary(task, now, view.tasks) if task else None,
+        "new_task": _task_summary(new_task, now, view.tasks) if new_task else None,
     }
     if new_task is not None and new_task.scheduled_start and new_task.scheduled_end:
         result["overlaps_with"] = [
@@ -173,11 +183,29 @@ def _result(runtime: Runtime, call: ActionCall, events: list[TemporalEvent]) -> 
     return result
 
 
+def _key(idempotency_key: Optional[str]) -> str:
+    if not idempotency_key:
+        return str(uuid.uuid4())
+    if len(idempotency_key) > MAX_KEY_LENGTH:
+        raise ValueError(f"idempotency_key is too long ({len(idempotency_key)} characters; the limit is {MAX_KEY_LENGTH})")
+    return idempotency_key
+
+
+def _clip(reason: str) -> str:
+    return reason if len(reason) <= MAX_REASON_LENGTH else reason[: MAX_REASON_LENGTH - 1] + "\u2026"
+
+
+def _nearness(task: Task, now: datetime) -> float:
+    """How far a task's most relevant time is from now: nearest first when a listing must be cut."""
+    reference = task.scheduled_start or task.deadline or now
+    return abs((reference - now).total_seconds())
+
+
 def _execute(runtime: Runtime, action: str, task_id: Optional[str], args: dict, reason: str,
              idempotency_key: Optional[str]) -> dict[str, Any]:
     call = ActionCall(
-        idempotency_key=idempotency_key or str(uuid.uuid4()),
-        action=action, task_id=task_id, args=args, reason=reason,
+        idempotency_key=_key(idempotency_key),
+        action=action, task_id=task_id, args=args, reason=_clip(reason),
     )
     return _result(runtime, call, runtime.execute(call))
 
@@ -213,6 +241,8 @@ async def get_temporal_context(
     )
 
     active = [t for t in view.tasks.values() if not t.is_terminal()]
+    shown = sorted(active, key=lambda t: _nearness(t, now))[:MAX_LISTED_TASKS]
+    conflicts = find_conflicts(active, limit=MAX_LISTED_CONFLICTS + 1)
     health = runtime.health
     out: dict[str, Any] = {
         "now": now.astimezone(ZoneInfo(runtime.day_boundary_tz)).isoformat(),   # display only
@@ -223,21 +253,27 @@ async def get_temporal_context(
             "last_tick_at": _iso(health.last_tick_at),
             "last_error": health.last_error,
             "consecutive_errors": health.consecutive_errors,
+            "recurrence_errors": dict(health.recurrence_errors),
+            "clock_regressions": health.clock_regressions,
+            "last_clock_warning": health.last_clock_warning,
         },
         "quarantined_events": len(view.quarantined),
         "agent": runtime.agent.status() if runtime.agent else {"enabled": False},
-        "tasks": [_task_summary(t, now) for t in active],
+        "tasks": [_task_summary(t, now, view.tasks) for t in shown],     # nearest to now first
+        "tasks_total": len(active),
+        "tasks_truncated": len(active) > len(shown),
         "conflicts": [
             {"a": {"id": a.id, "title": a.title}, "b": {"id": b.id, "title": b.title}}
-            for a, b in find_conflicts(active)
+            for a, b in conflicts[:MAX_LISTED_CONFLICTS]
         ],
+        "conflicts_truncated": len(conflicts) > MAX_LISTED_CONFLICTS,
         "pending_actions": [
             {"idempotency_key": key, "action": c["action"], "task_id": c.get("task_id"),
              "reason": c.get("reason", ""), "args": c.get("args", {})}
-            for key, c in view.pending.items()
+            for key, c in list(view.pending.items())[:MAX_LISTED_OTHER]
         ],
         "recurrences": [
-            _recurrence_summary(r, now) for r in view.recurrences.values()
+            _recurrence_summary(r, now) for r in list(view.recurrences.values())[:MAX_LISTED_OTHER]
             if include_finished or not r.ended
         ],
         "events": [_event_summary(e) for e in events],
@@ -250,8 +286,31 @@ async def get_temporal_context(
             key=lambda t: t.last_transition_at or datetime.min.replace(tzinfo=now.tzinfo),
             reverse=True,
         )[:MAX_FINISHED_TASKS]
-        out["finished_tasks"] = [_task_summary(t, now) for t in finished]
+        out["finished_tasks"] = [_task_summary(t, now, view.tasks) for t in finished]
     return out
+
+
+@mcp.tool()
+async def get_state_as_of(ctx: Context, at: str, include_finished: bool = False) -> dict[str, Any]:
+    """The task list as it stood at a given instant (ISO 8601 WITH a UTC offset): \"what did the plan look like
+    at 4pm yesterday?\", \"what should I have done by then?\". Built from what the system had recorded by then,
+    with time-derived statuses (active, window ended, overdue) brought to that instant. For a FUTURE instant it
+    is a projection: only the clock is assumed to move tasks on. Finished tasks are omitted unless
+    include_finished is set."""
+    runtime: Runtime = ctx.request_context.lifespan_context
+    when = lenient_datetime(at)
+    if not isinstance(when, datetime) or when.tzinfo is None:
+        raise ValueError(f"at must be an ISO 8601 datetime with a UTC offset, got {at!r}")
+    state = runtime.state_as_of(when)
+    tasks = [t for t in state.values() if include_finished or not t.is_terminal()]
+    tasks.sort(key=lambda t: _nearness(t, when))
+    return {
+        "as_of": when.astimezone(ZoneInfo(runtime.day_boundary_tz)).isoformat(),
+        "is_projection": when > runtime.clock.now(),
+        "tasks": [_task_summary(t, when, state) for t in tasks[:MAX_LISTED_TASKS]],
+        "tasks_total": len(tasks),
+        "tasks_truncated": len(tasks) > MAX_LISTED_TASKS,
+    }
 
 
 @mcp.tool()
@@ -280,20 +339,46 @@ async def create_task(
     scheduled_start: Optional[str] = None,
     scheduled_end: Optional[str] = None,
     deadline: Optional[str] = None,
+    estimated_minutes: Optional[int] = None,
+    depends_on: Optional[list[str]] = None,
     idempotency_key: Optional[str] = None,
 ) -> dict[str, Any]:
     """Create a task. Times are ISO 8601 WITH a UTC offset, e.g.
     '2026-09-12T14:00:00+05:30'. `timezone` is an IANA name used for display.
     A window needs both scheduled_start and scheduled_end (end after start);
     a task may have only a deadline. The response lists any overlapping
-    tasks; overlaps are reported, not refused."""
+    tasks; overlaps are reported, not refused.
+
+    `estimated_minutes` (optional) is how long you expect it to take; the
+    server then reports arithmetic such as `estimate_exceeds_window` and
+    `at_risk_of_missing_deadline`. `depends_on` (optional) lists ids of
+    EXISTING tasks that should be finished first; the task is reported
+    `is_blocked` with `blocked_by` until they are, but is never refused
+    (people work out of order). A moved dependency is followed to its
+    replacement."""
     runtime: Runtime = ctx.request_context.lifespan_context
     return _execute(runtime, "create_task", None, {
         "title": title, "display_timezone": timezone,
         "scheduled_start": lenient_datetime(scheduled_start),
         "scheduled_end": lenient_datetime(scheduled_end),
         "deadline": lenient_datetime(deadline),
+        "estimated_minutes": estimated_minutes, "depends_on": depends_on,
     }, "", idempotency_key)
+
+
+@mcp.tool()
+async def import_calendar(
+    ctx: Context, ics: str, source: str = "calendar", timezone: Optional[str] = None,
+) -> dict[str, Any]:
+    """Import events from the TEXT of an iCalendar (.ics) export as tasks. Re-importing is safe: an event is
+    identified by (`source`, its UID), so nothing is duplicated; an event whose time changed is rescheduled, one
+    now marked cancelled is cancelled, and a task you already finished or removed here is left alone. Events that
+    cannot be represented faithfully are skipped WITH A REASON in `skipped_events`: all-day events, events with no
+    end time, recurring events (use create_recurring_task), unknown time zones. `timezone` is the IANA zone for
+    floating times and display (default: the engine's). Use a different `source` name per calendar; overlaps
+    between them show up as conflicts. Nothing is fetched: pass the file's text."""
+    runtime: Runtime = ctx.request_context.lifespan_context
+    return _import_calendar(runtime, ics, source, timezone)
 
 
 def _recurrence_result(runtime: Runtime, call: ActionCall, events: list[TemporalEvent]) -> dict[str, Any]:
@@ -309,7 +394,7 @@ def _recurrence_result(runtime: Runtime, call: ActionCall, events: list[Temporal
         "idempotency_key": call.idempotency_key,
         "recurrence": _recurrence_summary(rec, now) if rec else None,
         "instances": [
-            _task_summary(view.tasks[e.task_id], now)
+            _task_summary(view.tasks[e.task_id], now, view.tasks)
             for e in events if e.event_type == EventType.TASK_CREATED and e.task_id in view.tasks
         ],
         "occurrences_skipped": sum(
@@ -348,7 +433,7 @@ async def create_recurring_task(
     others. Use end_recurring_task to stop the series."""
     runtime: Runtime = ctx.request_context.lifespan_context
     call = ActionCall(
-        idempotency_key=idempotency_key or str(uuid.uuid4()), action="create_recurrence", task_id=None,
+        idempotency_key=_key(idempotency_key), action="create_recurrence", task_id=None,
         args={
             "title": title, "display_timezone": timezone, "frequency": frequency, "start_time": start_time,
             "duration_minutes": duration_minutes, "interval": interval, "weekdays": weekdays,
@@ -367,7 +452,7 @@ async def end_recurring_task(
     do not want."""
     runtime: Runtime = ctx.request_context.lifespan_context
     call = ActionCall(
-        idempotency_key=idempotency_key or str(uuid.uuid4()), action="end_recurrence", task_id=None,
+        idempotency_key=_key(idempotency_key), action="end_recurrence", task_id=None,
         args={"recurrence_id": recurrence_id},
     )
     return _recurrence_result(runtime, call, runtime.execute(call))

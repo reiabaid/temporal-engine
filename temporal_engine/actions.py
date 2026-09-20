@@ -45,6 +45,24 @@ _DATETIME_ARGS = ("new_start", "new_end", "new_deadline", "scheduled_start", "sc
 # calendar dates, not instants, and build_recurrence parses them.)
 
 
+# The decision log records what was proposed -- but not without limit. A rejected call used to write its
+# entire arguments (and any error message echoing them) into an append-only log that can never be trimmed.
+MAX_LOGGED_CHARS = 1000
+MAX_HELD_ARGS_REPR = 20_000
+
+
+def _shrink(value: Any) -> Any:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if isinstance(value, str) and len(value) > MAX_LOGGED_CHARS:
+        return value[:MAX_LOGGED_CHARS] + f"...[{len(value)} chars, truncated in the log]"
+    if isinstance(value, (list, tuple)):
+        return [_shrink(v) for v in value[:50]]
+    if isinstance(value, dict):
+        return {str(k): _shrink(v) for k, v in list(value.items())[:50]}
+    return value
+
+
 @dataclass
 class ActionCall:
     idempotency_key: str
@@ -54,6 +72,10 @@ class ActionCall:
     args: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
     requires_confirmation: bool = False
+    # Ids of the events that led to this call (the agent sets it to the triggers it was woken for). Together with
+    # `action_key` on every event an applied call produces, this makes "why did that happen?" a chain you can
+    # follow in the log: trigger event -> decision (ACTION_PROPOSED) -> resulting events.
+    caused_by: tuple[str, ...] = ()
 
 
 def lenient_datetime(value: Any) -> Any:
@@ -81,6 +103,7 @@ def action_call_from_payload(call: dict) -> ActionCall:
         args=args,
         reason=call.get("reason", ""),
         requires_confirmation=bool(call.get("requires_confirmation", False)),
+        caused_by=tuple(call.get("caused_by", ())),
     )
 
 
@@ -104,6 +127,8 @@ def apply_action(
         return [_decision_event(call, now, "superseded", "duplicate idempotency_key")]
 
     if call.requires_confirmation and not confirmed:
+        if len(repr(call.args)) > MAX_HELD_ARGS_REPR:   # a hold must be stored whole to be confirmable later
+            return [_decision_event(call, now, "rejected", "arguments are too large to hold for confirmation")]
         return [_decision_event(call, now, "pending_confirmation")]
 
     try:
@@ -112,6 +137,8 @@ def apply_action(
         return [_decision_event(call, now, "rejected", str(exc))]
 
     seen_idempotency_keys.add(call.idempotency_key)
+    for event in events:
+        event.payload["action_key"] = call.idempotency_key      # what caused this event
     return [_decision_event(call, now, "applied")] + events
 
 
@@ -143,6 +170,8 @@ def _dispatch(
             scheduled_end=a.get("scheduled_end"),
             deadline=a.get("deadline"),
             idempotency_key=call.idempotency_key,
+            estimated_minutes=a.get("estimated_minutes"),
+            depends_on=a.get("depends_on"),
         )
         return events
 
@@ -179,14 +208,12 @@ def _decision_event(
                 "idempotency_key": call.idempotency_key,
                 "action": call.action,
                 "task_id": call.task_id,
-                "args": {
-                    k: (v.isoformat() if hasattr(v, "isoformat") else v)
-                    for k, v in call.args.items()
-                },
-                "reason": call.reason,
+                "args": {k: _shrink(v) for k, v in call.args.items()},
+                "reason": _shrink(call.reason),
                 "requires_confirmation": call.requires_confirmation,
+                "caused_by": list(call.caused_by),
             },
             "outcome": outcome,
-            "rejection_reason": rejection_reason,
+            "rejection_reason": _shrink(rejection_reason),
         },
     )

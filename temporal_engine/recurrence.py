@@ -39,6 +39,8 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Iterator, Optional
 from zoneinfo import ZoneInfo
 
+from temporal_engine.task import MAX_TITLE_LENGTH
+
 WEEKDAY_CODES = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
 FREQUENCIES = ("daily", "weekly", "monthly")
 MAX_CANDIDATES = 200_000  # safety bound on expansion; far beyond any real rule
@@ -83,6 +85,7 @@ class Recurrence:
             frequency=p["frequency"], start_time=p["start_time"], first_date=p["first_date"],
             interval=p.get("interval", 1), weekdays=p.get("weekdays"), month_days=p.get("month_days"),
             duration_minutes=p.get("duration_minutes"), until=p.get("until"), count=p.get("count"),
+            check_bounds=False,
         )
 
     def describe(self) -> str:
@@ -142,11 +145,18 @@ def build_recurrence(
     duration_minutes: Any = None,
     until: Any = None,
     count: Any = None,
+    check_bounds: bool = True,
 ) -> Recurrence:
     """Validate and build. Every input may come from an LLM, so every
-    failure is a ValueError with a readable reason."""
+    failure is a ValueError with a readable reason.
+
+    `check_bounds=False` is for rebuilding a template from the log: limits
+    introduced later must apply to NEW input only, never make an
+    already-recorded template unreadable."""
     if not isinstance(title, str) or not title.strip():
         raise ValueError("title must be a non-empty string")
+    if check_bounds and len(title) > MAX_TITLE_LENGTH:
+        raise ValueError(f"title is too long ({len(title)} characters; the limit is {MAX_TITLE_LENGTH})")
     try:
         ZoneInfo(display_timezone)
     except (KeyError, ValueError, TypeError) as exc:
@@ -253,8 +263,12 @@ def occurrence_dates(rec: Recurrence, through: date) -> list[date]:
     limit = min(through, rec.until) if rec.until else through
     dates: list[date] = []
     for examined, current in enumerate(_candidates(rec), start=1):
-        if current > limit or examined > MAX_CANDIDATES:
+        if current > limit:
             break
+        if examined > MAX_CANDIDATES:
+            # Never truncate silently: a cut-off expansion would stop short of the present and quietly
+            # generate nothing, every pass, forever.
+            raise ValueError("this recurrence expands to too many occurrences; check first_date and interval")
         dates.append(current)
         if rec.count is not None and len(dates) >= rec.count:
             break

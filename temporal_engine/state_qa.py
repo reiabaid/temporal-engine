@@ -39,13 +39,15 @@ from zoneinfo import ZoneInfo
 
 from temporal_engine.actions import ActionCall
 from temporal_engine.events import EventType
+from temporal_engine.planning import planning_report
 from temporal_engine.runtime import Runtime
 from temporal_engine.scheduler import SimulatedClock
 from temporal_engine.task import Task, TaskStatus
 
 UTC = timezone.utc
 
-CATEGORIES = ["window_states", "deadlines", "completions", "moves", "local_midnight", "dst_recurrence"]
+CATEGORIES = ["window_states", "deadlines", "completions", "moves", "local_midnight", "dst_recurrence",
+              "historical", "dependencies"]
 
 DEFINITIONS = """\
 Status definitions. Apply the first rule that fits:
@@ -59,6 +61,12 @@ Status definitions. Apply the first rule that fits:
 - CREATED: it has no window (at most a deadline) and that deadline has not passed.
 If a task was rescheduled or carried forward, its status is that of its newest version (the latest window given); older versions are not asked about.
 All times are instants. Compare them as instants, converting UTC offsets, never as clock digits."""
+
+HISTORICAL_NOTE = """\
+This question is about an EARLIER moment, not the present. Treat only what had happened by the question time as having happened: a completion, cancellation or reschedule that occurs after it has not happened yet, so it must not affect the answer. The history continues past the question time on purpose."""
+
+DEPENDENCY_NOTE = """\
+Some tasks depend on others ("depends on ..."). Extra status BLOCKED: a task that is not done and not cancelled, and depends on at least one task that is neither done nor cancelled, is BLOCKED. This is checked before the time-based rules (OVERDUE, WINDOW_ENDED, ACTIVE, SCHEDULED, CREATED), so a blocked task is BLOCKED whatever the clock says. A dependency that was rescheduled or carried forward is still unfinished until its newest version is done. A dependency that was cancelled no longer blocks. A completed dependency, even a late one, no longer blocks."""
 
 RECURRENCE_NOTE = """\
 Recurring tasks: every date the rule produces is its own task, named "Title@YYYY-MM-DD" (the local date). Its window starts at the rule's start time on that date in the rule's timezone and lasts the stated duration in real elapsed time. Start times are local wall-clock times in that timezone, so the UTC instant depends on daylight saving time on that date. A local time that does not exist that day (skipped by a clock change) means the same instant read with the UTC offset in force just before the change; a local time that occurs twice means its first occurrence."""
@@ -82,6 +90,7 @@ class Fact:
     deadline: Optional[datetime]
     done_at: Optional[datetime]
     cancelled: bool
+    blocked: bool = False      # depends on something neither finished nor cancelled (worked out from the script, not the engine)
 
 
 @dataclass
@@ -95,6 +104,9 @@ class QACase:
     asked: list[str]
     expected: dict[str, str] = field(default_factory=dict)
     facts: dict[str, Fact] = field(default_factory=dict)
+    # Set for a historical question: `now` is then the question time and `present` the real current time, which is
+    # later. The history includes events between the two, which the answer must ignore.
+    present: Optional[datetime] = None
 
 
 def _local(dt: datetime, tz: str) -> str:
@@ -114,6 +126,8 @@ def derive_status(fact: Fact, now: datetime) -> str:
         late = (fact.end is not None and fact.done_at >= fact.end) or \
                (fact.deadline is not None and fact.done_at >= fact.deadline)
         return "COMPLETED_LATE" if late else "COMPLETED"
+    if fact.blocked:
+        return "BLOCKED"
     if fact.deadline is not None and now >= fact.deadline:
         return "OVERDUE"
     if fact.start is None:
@@ -136,6 +150,10 @@ def execute_case(case: QACase) -> tuple[dict[str, str], dict[str, Fact]]:
         try:
             runtime.run_pass()
             current: dict[str, str] = {}
+            chains: dict[str, list[str]] = {}          # every version a task has had, oldest first
+            depends: dict[str, list[str]] = {}
+            done_keys: set[str] = set()                # what the SCRIPT says is finished, independent of the engine
+            gone_keys: set[str] = set()
 
             def act(action: str, task_id, args: dict, key: str):
                 events = runtime.execute(ActionCall(f"qa-{next(_counter)}", action, task_id, args))
@@ -150,24 +168,39 @@ def execute_case(case: QACase) -> tuple[dict[str, str], dict[str, Fact]]:
                     events = act("create_task", None, {
                         "title": step.key, "display_timezone": tz, "scheduled_start": a.get("start"),
                         "scheduled_end": a.get("end"), "deadline": a.get("deadline"),
+                        "depends_on": [current[d] for d in a.get("depends", [])] or None,
                     }, step.key)
                     current[step.key] = next(e.task_id for e in events if e.event_type == EventType.TASK_CREATED)
+                    chains[step.key] = [current[step.key]]
+                    depends[step.key] = list(a.get("depends", []))
                 elif step.kind in ("reschedule", "carry"):
                     events = act("reschedule_task" if step.kind == "reschedule" else "carry_forward_task",
                                  current[step.key], {"new_start": a["start"], "new_end": a["end"]}, step.key)
                     current[step.key] = next(e.task_id for e in events if e.event_type == EventType.TASK_CREATED)
+                    chains[step.key].append(current[step.key])
                 elif step.kind == "complete":
                     act("complete_task", current[step.key], {}, step.key)
+                    if step.at <= case.now:
+                        done_keys.add(step.key)
                 elif step.kind == "cancel":
                     act("cancel_task", current[step.key], {"mode": "cancel"}, step.key)
+                    if step.at <= case.now:
+                        gone_keys.add(step.key)
                 elif step.kind == "recur":
                     act("create_recurrence", None, {"title": step.key, "display_timezone": tz, **a}, step.key)
                 else:
                     raise ValueError(step.kind)
 
-            clock.set(case.now)
+            clock.set(case.present or case.now)
             runtime.run_pass()
             tasks = runtime.store.refresh().tasks
+            if case.present is not None:
+                # A historical question: ask the engine what was true at the question time. The version of each task
+                # that existed then is the newest one in its chain that had been created by then.
+                tasks = runtime.state_as_of(case.now)
+
+            def version(key: str) -> Task:
+                return tasks[next(i for i in reversed(chains[key]) if i in tasks)]
 
             def latest(matching) -> Optional[Task]:
                 found = [t for t in tasks.values() if matching(t)]
@@ -179,14 +212,20 @@ def execute_case(case: QACase) -> tuple[dict[str, str], dict[str, Fact]]:
                     title, occurrence = key.split("@", 1)
                     task = latest(lambda t: t.title == title and t.occurrence == occurrence)
                 else:
-                    task = tasks[current[key]]
+                    task = version(key)
                 assert task is not None, (case.id, key)
-                statuses[key] = task.status.value
                 completed = task.status in (TaskStatus.COMPLETED, TaskStatus.COMPLETED_LATE)
+                # BLOCKED is worked out from the script alone, and the engine's own report must agree with it.
+                blocked = key in depends and not task.is_terminal() and any(
+                    d not in done_keys and d not in gone_keys for d in depends[key])
+                if key in depends and not task.is_terminal():
+                    report = planning_report(tasks, task, case.now)
+                    assert report.get("is_blocked", False) == blocked, (case.id, key, report, blocked)
+                statuses[key] = "BLOCKED" if blocked else task.status.value
                 facts[key] = Fact(
                     start=task.scheduled_start, end=task.scheduled_end, deadline=task.deadline,
                     done_at=task.last_transition_at if completed else None,
-                    cancelled=task.status == TaskStatus.CANCELLED,
+                    cancelled=task.status == TaskStatus.CANCELLED, blocked=blocked,
                 )
             return statuses, facts
         finally:
@@ -373,9 +412,80 @@ def gen_dst_recurrence(seed: int, n: int) -> list[QACase]:
     ]
 
 
+def gen_historical(seed: int, n: int) -> list[QACase]:
+    """'What was the status at 4pm yesterday?' The history runs PAST the question time: completions, cancellations
+    and moves that happen afterwards must not leak into the answer. Truth is the engine's state_as_of."""
+    cases = []
+    for i in range(n):
+        rng = random.Random(f"hi-{seed}-{i}")
+        tz, present = rng.choice(ZONES), _base(rng)
+        question = present - _m(rng.randint(200, 500))
+        a, b, c, d, e = rng.sample(NAMES, 5)
+        made = question - _m(900)
+        steps = [
+            Step(made, "create", a, {"start": question - _m(30), "end": question + _m(60)}),
+            Step(question + _m(rng.randint(10, 40)), "complete", a),                    # done AFTER the question: ACTIVE then
+            Step(made, "create", b, {"start": question - _m(200), "end": question - _m(120)}),
+            Step(question + _m(rng.randint(20, 150)), "complete", b),                   # done after: WINDOW_ENDED then
+            Step(made, "create", c, {"start": question + _m(30), "end": question + _m(90)}),
+            Step(question + _m(rng.randint(10, 25)), "reschedule", c, {"start": question + _m(120), "end": question + _m(180)}),
+            Step(made, "create", d, {"start": question + _m(60), "end": question + _m(120)}),
+            Step(question + _m(rng.randint(5, 50)), "cancel", d),                       # cancelled after: SCHEDULED then
+            Step(made, "create", e, {"start": question - _m(300), "end": question - _m(240)}),
+            Step(question - _m(250), "complete", e),                                    # done before: COMPLETED
+        ]
+        steps.sort(key=lambda s: (s.at, s.kind != "create"))
+        cases.append(_finish(QACase(f"historical-{seed}-{i}", "historical", tz, steps, question,
+                                    rng.random() < 0.5, [a, b, c, d, e], present=present)))
+    return cases
+
+
+def gen_dependencies(seed: int, n: int) -> list[QACase]:
+    """Blocked or not, following a dependency through moves, completions and cancellations."""
+    cases = []
+    for i in range(n):
+        rng = random.Random(f"dp-{seed}-{i}")
+        tz, now = rng.choice(ZONES), _base(rng)
+        d1, t1, d2, t2, d3, t3, d4, t4, d5, t5, d6a, d6b, t6 = rng.sample(NAMES, 13)
+        made = now - _m(1000)
+        j = lambda lo, hi: _m(rng.randint(lo, hi))
+        steps = [
+            # unfinished dependency -> its dependent is BLOCKED, even though the dependent's own window is ahead
+            Step(made, "create", d1, {"start": now - _m(300), "end": now - _m(240)}),
+            Step(made, "create", t1, {"start": now + j(60, 120), "end": now + _m(300), "depends": [d1]}),
+            # dependency finished (late) -> the dependent has its own status again
+            Step(made, "create", d2, {"start": now - _m(300), "end": now - _m(240)}),
+            Step(now - _m(200), "complete", d2),
+            Step(made, "create", t2, {"start": now - _m(100), "end": now + j(50, 120), "depends": [d2]}),
+            # a moved dependency is still unfinished
+            Step(made, "create", d3, {"start": now - _m(300), "end": now - _m(240)}),
+            Step(now - _m(200), "reschedule", d3, {"start": now - _m(100), "end": now - _m(50)}),
+            Step(made, "create", t3, {"start": now + j(60, 120), "end": now + _m(300), "depends": [d3]}),
+            # a moved dependency that then gets finished no longer blocks
+            Step(made, "create", d4, {"start": now - _m(300), "end": now - _m(240)}),
+            Step(now - _m(200), "reschedule", d4, {"start": now - _m(150), "end": now - _m(100)}),
+            Step(now - _m(80), "complete", d4),
+            Step(made, "create", t4, {"start": now - _m(60), "end": now + j(30, 90), "depends": [d4]}),
+            # a cancelled dependency does not block
+            Step(made, "create", d5, {"start": now - _m(300), "end": now - _m(240)}),
+            Step(now - _m(200), "cancel", d5),
+            Step(made, "create", t5, {"start": now - _m(50), "end": now - _m(10), "depends": [d5]}),
+            # two dependencies, one finished and one not -> still BLOCKED
+            Step(made, "create", d6a, {"start": now - _m(300), "end": now - _m(240)}),
+            Step(now - _m(230), "complete", d6a),
+            Step(made, "create", d6b, {"start": now - _m(300), "end": now - _m(240)}),
+            Step(made, "create", t6, {"start": now - _m(20), "end": now + _m(60), "depends": [d6a, d6b]}),
+        ]
+        steps.sort(key=lambda s: (s.at, s.kind != "create"))
+        cases.append(_finish(QACase(f"dependencies-{seed}-{i}", "dependencies", tz, steps, now,
+                                    rng.random() < 0.5, [t1, t2, t3, t4, t5, t6])))
+    return cases
+
+
 GENERATORS: dict[str, Callable[[int, int], list[QACase]]] = {
     "window_states": gen_window_states, "deadlines": gen_deadlines, "completions": gen_completions,
     "moves": gen_moves, "local_midnight": gen_local_midnight, "dst_recurrence": gen_dst_recurrence,
+    "historical": gen_historical, "dependencies": gen_dependencies,
 }
 
 
@@ -399,6 +509,8 @@ def render_history(case: QACase) -> list[str]:
                              else f"starting {_local(a['start'], tz)} (no end)")
             if a.get("deadline"):
                 parts.append(f"deadline {_local(a['deadline'], tz)}")
+            if a.get("depends"):
+                parts.append("depends on " + ", ".join(f'"{d}"' for d in a["depends"]))
             lines.append(f'{when}  created task "{step.key}": {", ".join(parts) or "no window"}')
         elif step.kind == "reschedule":
             lines.append(f'{when}  rescheduled "{step.key}" to window {_local(a["start"], tz)} to {_local(a["end"], tz)}')
@@ -417,21 +529,32 @@ def render_history(case: QACase) -> list[str]:
 
 
 def render_prompt(case: QACase) -> str:
-    now_text = case.now.astimezone(UTC).strftime("%Y-%m-%dT%H:%MZ") if case.now_in_utc_only else _local(case.now, case.timezone)
+    def shown(instant: datetime) -> str:
+        return instant.astimezone(UTC).strftime("%Y-%m-%dT%H:%MZ") if case.now_in_utc_only else _local(instant, case.timezone)
+
+    historical = case.present is not None
     parts = [
         "You keep no state between conversations. Below is the complete history of a user's task list, oldest first, "
-        "followed by the current time. Work out the CURRENT status of each task listed at the end.",
+        "followed by the current time. "
+        + ("Work out the status of each task listed at the end AS THINGS STOOD at the question time."
+           if historical else "Work out the CURRENT status of each task listed at the end."),
         f"The user's timezone is {case.timezone}. History timestamps are in that timezone and carry their UTC offset.",
         DEFINITIONS,
     ]
     if any(s.kind == "recur" for s in case.steps):
         parts.append(RECURRENCE_NOTE)
+    if historical:
+        parts.append(HISTORICAL_NOTE)
+    if any(s.args.get("depends") for s in case.steps):
+        parts.append(DEPENDENCY_NOTE)
     parts += [
         "History:\n" + "\n".join(render_history(case)),
-        f"Current time: {now_text}",
-        "Answer with a single JSON object mapping each task name to its status, and nothing else. Tasks: "
-        + ", ".join(f'"{k}"' for k in case.asked),
+        f"Current time: {shown(case.present if historical else case.now)}",
     ]
+    if historical:
+        parts.append(f"Question time (report the status of each task at this moment): {shown(case.now)}")
+    parts.append("Answer with a single JSON object mapping each task name to its status, and nothing else. Tasks: "
+                 + ", ".join(f'"{k}"' for k in case.asked))
     return "\n\n".join(parts)
 
 
@@ -493,8 +616,34 @@ class IgnoresDeadlines(_FlawedSolver):
     name = "flaw:ignores-deadlines"
 
     def solve(self, case):
-        return {k: derive_status(Fact(f.start, f.end, None, f.done_at, f.cancelled), case.now)
+        return {k: derive_status(Fact(f.start, f.end, None, f.done_at, f.cancelled, f.blocked), case.now)
                 for k, f in case.facts.items()}
+
+
+class IgnoresDependencies(_FlawedSolver):
+    """Never says BLOCKED: reads each task as if it stood alone. Must fail `dependencies` and nothing else."""
+    name = "flaw:ignores-dependencies"
+
+    def solve(self, case):
+        return {k: derive_status(Fact(f.start, f.end, f.deadline, f.done_at, f.cancelled, False), case.now)
+                for k, f in case.facts.items()}
+
+
+class AnswersForThePresent(_FlawedSolver):
+    """Answers a historical question with what has happened SINCE: lets a completion or cancellation that came after
+    the question time count. Must fail `historical` and nothing else (no other category has a later present)."""
+    name = "flaw:answers-for-the-present"
+
+    def solve(self, case):
+        if case.present is None:
+            return {k: derive_status(f, case.now) for k, f in case.facts.items()}
+        out = {}
+        for key, fact in case.facts.items():
+            later = [s for s in case.steps if s.key == key and s.kind in ("complete", "cancel") and s.at > case.now]
+            done_at = next((s.at for s in later if s.kind == "complete"), fact.done_at)
+            cancelled = fact.cancelled or any(s.kind == "cancel" for s in later)
+            out[key] = derive_status(Fact(fact.start, fact.end, fact.deadline, done_at, cancelled, fact.blocked), case.present)
+        return out
 
 
 class ReadsClockDigits(_FlawedSolver):
@@ -505,7 +654,7 @@ class ReadsClockDigits(_FlawedSolver):
     def solve(self, case):
         now = self._wall(case, case.now)
         return {k: derive_status(Fact(self._wall(case, f.start), self._wall(case, f.end), self._wall(case, f.deadline),
-                                      self._wall(case, f.done_at), f.cancelled), now)
+                                      self._wall(case, f.done_at), f.cancelled, f.blocked), now)
                 for k, f in case.facts.items()}
 
 
@@ -517,7 +666,7 @@ class MixesTimezones(_FlawedSolver):
     def solve(self, case):
         now = case.now.astimezone(UTC).replace(tzinfo=None)
         return {k: derive_status(Fact(self._wall(case, f.start), self._wall(case, f.end), self._wall(case, f.deadline),
-                                      self._wall(case, f.done_at), f.cancelled), now)
+                                      self._wall(case, f.done_at), f.cancelled, f.blocked), now)
                 for k, f in case.facts.items()}
 
 

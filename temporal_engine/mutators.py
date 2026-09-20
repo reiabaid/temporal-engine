@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timedelta
-from typing import Any, Literal, Optional
+from typing import Any, Callable, Literal, Optional
 from zoneinfo import ZoneInfo
 
 from temporal_engine.events import EventType, TemporalEvent
@@ -87,11 +87,19 @@ def create_task(
     scheduled_end: Optional[datetime] = None,
     deadline: Optional[datetime] = None,
     idempotency_key: Optional[str] = None,
+    estimated_minutes: Optional[int] = None,
+    depends_on: Optional[list[str]] = None,
 ) -> tuple[Task, list[TemporalEvent]]:
     task = Task.new(  # validates everything; raises ValueError on bad input
         title, display_timezone,
         scheduled_start=scheduled_start, scheduled_end=scheduled_end, deadline=deadline,
+        estimated_minutes=estimated_minutes, depends_on=depends_on,
     )
+    # A dependency must already exist, which is also what makes a cycle impossible: a task can only point at
+    # tasks older than itself.
+    unknown = [d for d in task.depends_on if d not in tasks]
+    if unknown:
+        raise ValueError(f"depends_on names unknown task ids: {unknown}")
     tasks[task.id] = task
     return task, [task_created_event(task, at=now, idempotency_key=idempotency_key)]
 
@@ -155,6 +163,8 @@ def _relocate(
         deadline=deadline,
     )
     new_task.carried_from = task.id
+    new_task.estimated_minutes = task.estimated_minutes      # a moved task is the same piece of work
+    new_task.depends_on = task.depends_on
     # A moved occurrence is still that occurrence: keeping its identity is
     # what stops the generator from creating "the missing one" again.
     new_task.recurrence_id = task.recurrence_id
@@ -207,6 +217,7 @@ def cancel_task(task: Task, mode: Literal["drop", "cancel"], now: datetime) -> T
 
 DEFAULT_HORIZON = timedelta(days=7)      # occurrences are created this far ahead
 DEFAULT_LOOKBACK = timedelta(hours=24)   # after downtime, only this much missed history is created
+MAX_RECURRENCE_SPAN_DAYS = 5 * 366       # a new template's first_date must be within ~5 years of today
 
 
 def create_recurrence(
@@ -228,6 +239,11 @@ def create_recurrence(
         interval=args.get("interval", 1), weekdays=args.get("weekdays"), month_days=args.get("month_days"),
         duration_minutes=args.get("duration_minutes"), until=args.get("until"), count=args.get("count"),
     )
+    # Sanity bounds on NEW input only (a template read back from the log is never re-checked). An absurd
+    # first_date used to be accepted, generate nothing, and burn CPU on every pass forever.
+    today = now.astimezone(ZoneInfo(recurrence.display_timezone)).date()
+    if abs((recurrence.first_date - today).days) > MAX_RECURRENCE_SPAN_DAYS:
+        raise ValueError(f"first_date must be within 5 years of today ({today}), got {recurrence.first_date}")
     recurrences[recurrence.id] = recurrence
     payload = recurrence.to_payload()
     if idempotency_key:
@@ -247,45 +263,72 @@ def end_recurrence(recurrences: dict[str, Recurrence], recurrence_id: Optional[s
     return TemporalEvent(EventType.RECURRENCE_ENDED, now, now, payload={"recurrence_id": recurrence.id})
 
 
+def _materialize_one(
+    view: View, recurrence: Recurrence, now: datetime, horizon: timedelta, lookback: timedelta,
+) -> tuple[list[Task], list[TemporalEvent]]:
+    """Everything one template should create now. Touches nothing in `view`:
+    the caller applies the result only if the WHOLE template succeeded, so a
+    failure partway can never leave tasks in memory that are not in the log."""
+    tz = ZoneInfo(recurrence.display_timezone)
+    through = (now + horizon).astimezone(tz).date()
+    gap_through = view.gap_through.get(recurrence.id)
+
+    tasks: list[Task] = []
+    events: list[TemporalEvent] = []
+    skipped, last_skipped = 0, None
+    for on in occurrence_dates(recurrence, through):
+        if (recurrence.id, on.isoformat()) in view.materialized:
+            continue
+        if gap_through is not None and on <= gap_through:
+            continue
+        start, end = occurrence_window(recurrence, on)
+        if start < now - lookback:
+            skipped, last_skipped = skipped + 1, on
+            continue
+        task = Task.new(recurrence.title, recurrence.display_timezone, scheduled_start=start, scheduled_end=end)
+        task.recurrence_id, task.occurrence = recurrence.id, on.isoformat()
+        tasks.append(task)
+        events.append(task_created_event(task, at=now))
+
+    if skipped:
+        events.append(TemporalEvent(EventType.RECURRENCE_GAP, now, now, payload={
+            "recurrence_id": recurrence.id, "through_date": last_skipped.isoformat(), "skipped": skipped,
+        }))
+    return tasks, events
+
+
 def materialize(
     view: View, now: datetime, horizon: timedelta = DEFAULT_HORIZON, lookback: timedelta = DEFAULT_LOOKBACK,
+    on_error: Optional[Callable[[Recurrence, Exception], None]] = None,
 ) -> list[TemporalEvent]:
     """Create any occurrence that should exist and does not. Deterministic
     and idempotent: an occurrence's identity is (template id, local date),
     so running this twice, from two processes, or after a crash creates
     each occurrence exactly once. A skipped (cancelled) or moved occurrence
-    still counts as existing, so it is never quietly recreated.
+    still counts as existing and is never quietly recreated.
 
     Occurrences older than `lookback` are not created -- a month of downtime
     must not spawn a month of "missed" tasks for the user (and the agent) to
     wade through -- but the omission is recorded once as RECURRENCE_GAP.
     Occurrences inside the lookback are created even if already over, so
-    they read as missed (the tick that follows in the same pass ends them)."""
+    they read as missed (the tick that follows in the same pass ends them).
+
+    Templates are isolated from each other. Without `on_error` a failing
+    template raises; with it, the failure is reported and every OTHER
+    template (and, in the caller, every task's tick) carries on. One broken
+    template must never be able to freeze the scheduler for everything."""
     events: list[TemporalEvent] = []
-    for recurrence in view.recurrences.values():
+    for recurrence in list(view.recurrences.values()):
         if recurrence.ended:
             continue
-        tz = ZoneInfo(recurrence.display_timezone)
-        through = (now + horizon).astimezone(tz).date()
-        gap_through = view.gap_through.get(recurrence.id)
-
-        skipped, last_skipped = 0, None
-        for on in occurrence_dates(recurrence, through):
-            if (recurrence.id, on.isoformat()) in view.materialized:
-                continue
-            if gap_through is not None and on <= gap_through:
-                continue
-            start, end = occurrence_window(recurrence, on)
-            if start < now - lookback:
-                skipped, last_skipped = skipped + 1, on
-                continue
-            task = Task.new(recurrence.title, recurrence.display_timezone, scheduled_start=start, scheduled_end=end)
-            task.recurrence_id, task.occurrence = recurrence.id, on.isoformat()
+        try:
+            tasks, made = _materialize_one(view, recurrence, now, horizon, lookback)
+        except Exception as exc:
+            if on_error is None:
+                raise
+            on_error(recurrence, exc)
+            continue
+        for task in tasks:
             view.tasks[task.id] = task
-            events.append(task_created_event(task, at=now))
-
-        if skipped:
-            events.append(TemporalEvent(EventType.RECURRENCE_GAP, now, now, payload={
-                "recurrence_id": recurrence.id, "through_date": last_skipped.isoformat(), "skipped": skipped,
-            }))
+        events.extend(made)
     return events

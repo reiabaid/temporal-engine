@@ -55,13 +55,15 @@ Restart the client, then try: *"Create a task 'DSA' from 2pm to 4pm today, then 
 | Tool | What it does |
 |---|---|
 | `get_temporal_context` | Now (local), unfinished tasks, overlaps, held actions, scheduler health, recurrences, and events. Pass the returned `cursor` as `since_seq` next time to get only what's new. |
-| `create_task` | A task with an optional window and/or deadline. |
+| `create_task` | A task with an optional window, deadline, `estimated_minutes` and `depends_on` (ids of existing tasks). |
 | `start_task` | Record that work actually began (gives `worked_seconds`). |
 | `complete_task` | Done; recorded as late if the window or deadline had passed. |
 | `reschedule_task`, `carry_forward_task` | Supersede a task with a new one at a new time. |
 | `cancel_task` | `drop` or `cancel`. |
 | `create_recurring_task`, `end_recurring_task` | Daily / weekly / monthly series (see below). |
 | `list_pending_actions`, `confirm_action`, `reject_action` | The human-confirmation hold. |
+| `import_calendar` | Import the text of an `.ics` export as tasks; re-import is safe and follows changes and cancellations (see below). |
+| `get_state_as_of` | What every task's status was (or, for a future time, will be if only the clock acts) at a given instant. Answers "what was I doing at 3pm yesterday?". |
 
 Every mutating tool accepts an optional `idempotency_key`: retrying with the same key never does the thing twice, even across restarts.
 
@@ -82,12 +84,33 @@ Environment variables, set in the client's server entry:
 ## How it stays correct
 
 - **One source of truth.** State is an append-only event log; everything else is derived by replaying it. Every write is validated against the log's current state inside a write transaction, so two clients (say Claude Desktop and Claude Code) sharing one database cannot corrupt it. One process at a time is the scheduler; if it exits, another takes over.
-- **Catch-up.** Close the app while a task's window elapses and the next start ticks through every missed boundary. Nothing is generated *while* the app is closed — there is no background daemon — but the state is right when you return.
+- **Catch-up.** Close the app while a task's window elapses and the next start ticks through every missed boundary. Nothing is generated *while* the app is closed unless you run `temporal-engine run` (below), but the state is right when you return.
 - **Untrusted input.** Times and fields may come from an LLM, so they are validated at the boundary (timezone-aware, well-ordered, real IANA zones). A bad value is a logged rejection with a reason, never a crash.
 - **Bounded actions.** A task can be moved at most 3 times per 24 hours; a destructive action proposed by a model is held for human confirmation.
 - **DST done deliberately.** Times are unambiguous instants; recurrence follows local wall-clock time, with an explicit rule for skipped and repeated hours.
 
 Rationale, edge cases and the bugs found along the way are in [SPEC.md](SPEC.md).
+
+## Planning facts: estimates and dependencies
+
+`estimated_minutes` and `depends_on` are facts you supply; what follows from them is arithmetic the server does for you: `estimate_exceeds_window`, `at_risk_of_missing_deadline`, `remaining_estimate_minutes`, `is_blocked` / `blocked_by`, `scheduled_before_dependency`. A blocked task is *reported*, never refused (people work out of order). A dependency that was rescheduled is followed to its replacement; one that was cancelled is listed as `abandoned` instead of blocking forever.
+
+## Calendar import
+
+`import_calendar` takes the *text* of an iCalendar export (nothing is fetched, so no credentials). An event is identified by its source name and UID: re-importing does nothing, a changed time reschedules, `STATUS:CANCELLED` cancels, and a task you already finished here is left alone. All-day, no-end, recurring (RRULE) and unknown-time-zone events are skipped **with a reason** rather than guessed. Two calendars that overlap appear as ordinary conflicts.
+
+## Running without a client: `temporal-engine`
+
+```bash
+temporal-engine run                      # scheduler (and agent, if configured) with no AI client open
+temporal-engine watch --exec "notify.cmd"  # prints windows ending / deadlines / new days / held actions; runs your command per event
+temporal-engine status
+temporal-engine backup backup.db         # consistent copy; never overwrites
+temporal-engine export log.jsonl         # the log as JSON lines
+temporal-engine import log.jsonl --db new.db   # rebuild an EMPTY database
+```
+
+`watch` is the notification path: the engine does not push, but anything that can run a command can turn it into a toast or a message. The event reaches your command through environment variables (`TE_EVENT`, `TE_TEXT`, `TE_TASK_TITLE`), never spliced into the command line, because titles are untrusted.
 
 ## Recurring tasks
 
@@ -105,12 +128,13 @@ With `TEMPORAL_ENGINE_PROVIDER` set, the server reacts to *window ended*, *deadl
 
 - **No real model has been scored on the benchmark**, and none has driven the agent loop. Providers are tested against fakes; decision quality is unmeasured. `scripts/live_scenarios.py` scores a real model on four fixtures once you supply a key.
 - **Claude Desktop is untested.** Only Claude Code has been driven for real.
-- **No notifications.** Nothing pushes to you; clients pull. Whether any client would render a server push is unknown.
-- **Nothing runs while the client is closed** (state is corrected on next start).
+- **No push from the engine itself.** `temporal-engine watch --exec` is the hook; whether a given AI client would render a server push is unknown.
+- **Nothing runs while the client is closed** unless you start `temporal-engine run`; without it, state is corrected on next start.
 - **One user, one timezone** for the day boundary.
 - **Recurrence is a subset** — no yearly rules, no "second Tuesday", no iCalendar strings, templates aren't editable (end and recreate).
 - **Prompt injection is mitigated, not solved.**
-- Full list: [SPEC.md](SPEC.md), "Not done".
+- Durations are a single estimate, not a distribution; calendar import is one-way and manual (no live sync); creation is rate limited to 1000 tasks per 24 hours for everyone.
+- Full list: [SPEC.md](SPEC.md), "Not done"; requirement-by-requirement status: [AUDIT.md](AUDIT.md).
 
 ## Project layout
 
