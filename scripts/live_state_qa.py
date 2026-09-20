@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from temporal_engine.state_qa import (
-    CATEGORIES, AssumesFixedOffset, EngineSolver, IgnoresDeadlines, LLMSolver, MixesTimezones, ReadsClockDigits,
+    CATEGORIES, AnswersForThePresent, AssumesFixedOffset, EngineSolver, IgnoresDeadlines, IgnoresDependencies, LLMSolver, MixesTimezones, ReadsClockDigits,
     evaluate, generate, render_prompt,
 )
 
@@ -29,7 +29,8 @@ from temporal_engine.state_qa import (
 def build_solver(args):
     offline = {"engine": EngineSolver, "ignores-deadlines": IgnoresDeadlines,
                "clock-digits": ReadsClockDigits, "mixes-timezones": MixesTimezones,
-               "fixed-offset": AssumesFixedOffset}
+               "fixed-offset": AssumesFixedOffset, "ignores-dependencies": IgnoresDependencies,
+               "answers-for-present": AnswersForThePresent}
     if args.solver in offline:
         return offline[args.solver](), None
     if not args.model:
@@ -52,7 +53,7 @@ def build_solver(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--solver", choices=["engine", "ignores-deadlines", "clock-digits", "mixes-timezones",
-                                             "fixed-offset", "anthropic", "openai"])
+                                             "fixed-offset", "ignores-dependencies", "answers-for-present", "anthropic", "openai"])
     parser.add_argument("--model")
     parser.add_argument("--base-url")
     parser.add_argument("--temperature", type=float)
