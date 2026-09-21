@@ -2,7 +2,7 @@
 
 A deterministic, model-agnostic layer that gives an AI agent a *persistent, event-driven sense of time* — served over [MCP](https://modelcontextprotocol.io) so any MCP client can use it.
 
-> **Status: alpha.** Developed and tested on Windows with Python 3.12. It has been driven end to end through Claude Code, but **never against a live LLM in its optional agent loop**, and never tested in Claude Desktop. Not on PyPI. See [Known limitations](#known-limitations) before relying on it.
+> **Status: alpha.** Python 3.11+. Developed and tested on Windows; CI runs Linux and Windows (see `.github/workflows`). Driven end to end through Claude Code. **No real LLM has been run against the agent loop or the benchmark yet**, and it is untested in Claude Desktop. Not on PyPI. Read [Known limitations](#known-limitations) before relying on it.
 
 ## The problem
 
@@ -22,6 +22,64 @@ The idea here: **the LLM should not track time. A deterministic engine tracks ti
 
 `current_time > deadline` is never a model's job. *"What should we do because this is now overdue?"* is.
 
+## See it work (no API key)
+
+```bash
+pip install -e ".[dev]"
+python scripts/demo.py
+```
+
+One simulated day, real engine. A scripted policy stands in for the model, so the demo shows what the *engine* does: it notices each boundary itself, and the decision-maker is woken only when a decision is needed.
+
+```text
+Plan for Sat 12 Sep (Asia/Kolkata):
+  DSA practice  14:00-16:00   (the person never marks it done)
+  Send report   deadline 23:00
+  Standup       daily 09:30
+
+Sat 12 Sep 09:30
+   engine  started        Standup
+
+Sat 12 Sep 09:45
+   engine  WINDOW ENDED   Standup   (nobody marked it done)
+
+Sat 12 Sep 14:00
+   engine  started        DSA practice
+
+Sat 12 Sep 16:00
+   engine  WINDOW ENDED   DSA practice   (nobody marked it done)
+   agent   reschedule_task    DSA practice: try again this evening  [applied]
+
+Sat 12 Sep 19:00
+   engine  started        DSA practice
+
+Sat 12 Sep 21:00
+   engine  WINDOW ENDED   DSA practice   (nobody marked it done)
+   agent   carry_forward_task DSA practice: no time left today; carry to tomorrow morning  [applied]
+
+Sat 12 Sep 23:00
+   engine  DEADLINE MISSED Send report
+
+Sun 13 Sep 00:00
+   engine  NEW DAY        2026-09-13 (Asia/Kolkata)
+
+Sun 13 Sep 08:00
+
+What did the plan look like at 5pm on the 12th? (asked the next morning, answered from the log)
+   DSA practice  RESCHEDULED Sat 12 Sep 14:00 -> Sat 12 Sep 16:00
+   DSA practice  SCHEDULED   Sat 12 Sep 19:00 -> Sat 12 Sep 21:00
+   Send report   CREATED     no window
+
+Open now:
+   Send report   OVERDUE     no window
+   DSA practice  SCHEDULED   Sun 13 Sep 10:00 -> Sun 13 Sep 12:00
+
+The engine woke 9 times in 23 hours (a once-a-minute poll: 1380).
+The decision-maker was woken 5 times, each for a window ending, a missed deadline or a new day, never to ask the time.
+```
+
+Note what is *not* happening: no polling, no model call to ask the time, no lost event. The 5pm reconstruction is answered from the log, not from memory.
+
 ## Quick start
 
 From a checkout (not published to PyPI):
@@ -31,7 +89,7 @@ pip install -e ".[dev]"
 pytest                      # ~1 minute: integration tests spawn real server processes
 ```
 
-Register the server with an MCP client. For **Claude Code**, add a project-level `.mcp.json`:
+Register the server with an MCP client (a portable template is in `.mcp.example.json`; copy it to `.mcp.json`). For **Claude Code**, add a project-level `.mcp.json`:
 
 ```json
 {
@@ -124,6 +182,12 @@ With `TEMPORAL_ENGINE_PROVIDER` set, the server reacts to *window ended*, *deadl
 
 [BENCHMARK.md](BENCHMARK.md) describes **State-QA**: given a plain-text history and the current time, can a model derive each task's status? Ground truth comes from running the real engine; scoring is exact match with confidence intervals; deliberately flawed reference solvers prove the benchmark tells error classes apart. **No real model has been scored yet**, and the document is explicit about what a score would and would not show.
 
+## Results so far
+
+**Reference solvers only, not models.** State-QA scores programs with one deliberate flaw each, to show the benchmark tells error classes apart (full table in [BENCHMARK.md](BENCHMARK.md)); for example, a solver that ignores dependencies scores 30/60 on `dependencies` and 100% everywhere else, and one that reads clock digits instead of instants fails only the daylight-saving cases.
+
+**Real-model scores: none yet.** That is the open question this project exists to answer (does a model mis-derive temporal state from a history?), and it needs a run with an API key: `python scripts/live_state_qa.py --solver anthropic --model <id> ...`. Until then, treat the thesis as a hypothesis with a working test harness, not a finding.
+
 ## Known limitations
 
 - **No real model has been scored on the benchmark**, and none has driven the agent loop. Providers are tested against fakes; decision quality is unmeasured. `scripts/live_scenarios.py` scores a real model on four fixtures once you supply a key.
@@ -141,7 +205,9 @@ With `TEMPORAL_ENGINE_PROVIDER` set, the server reacts to *window ended*, *deadl
 ```
 temporal_engine/    the library and the MCP server (mcp_server.py)
 tests/              unit, deterministic multi-process, and real-server integration tests
-scripts/            manual, non-CI tools that need a real API key
+scripts/            demo.py (keyless day replay) and manual tools that need a real API key
+docs/               design-decisions.md (the reasoning), zoneinfo-trap.md (a Python pitfall), demo-output.txt
+AUDIT.md            requirement-by-requirement status against the original brief
 exercises/          early learning exercises, kept for history
 SPEC.md             the contract, design decisions, and change log
 PLAN.md             the original build plan (see the status note at its top)
@@ -149,4 +215,4 @@ PLAN.md             the original build plan (see the status note at its top)
 
 ## License
 
-None chosen yet. Until one is added, the default is "all rights reserved".
+No license has been chosen yet, so by default all rights are reserved. Add a `LICENSE` file before others reuse this.

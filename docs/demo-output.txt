@@ -1,0 +1,44 @@
+Plan for Sat 12 Sep (Asia/Kolkata):
+  DSA practice  14:00-16:00   (the person never marks it done)
+  Send report   deadline 23:00
+  Standup       daily 09:30
+
+Sat 12 Sep 09:30
+   engine  started        Standup
+
+Sat 12 Sep 09:45
+   engine  WINDOW ENDED   Standup   (nobody marked it done)
+
+Sat 12 Sep 14:00
+   engine  started        DSA practice
+
+Sat 12 Sep 16:00
+   engine  WINDOW ENDED   DSA practice   (nobody marked it done)
+   agent   reschedule_task    DSA practice: try again this evening  [applied]
+
+Sat 12 Sep 19:00
+   engine  started        DSA practice
+
+Sat 12 Sep 21:00
+   engine  WINDOW ENDED   DSA practice   (nobody marked it done)
+   agent   carry_forward_task DSA practice: no time left today; carry to tomorrow morning  [applied]
+
+Sat 12 Sep 23:00
+   engine  DEADLINE MISSED Send report
+
+Sun 13 Sep 00:00
+   engine  NEW DAY        2026-09-13 (Asia/Kolkata)
+
+Sun 13 Sep 08:00
+
+What did the plan look like at 5pm on the 12th? (asked the next morning, answered from the log)
+   DSA practice  RESCHEDULED Sat 12 Sep 14:00 -> Sat 12 Sep 16:00
+   DSA practice  SCHEDULED   Sat 12 Sep 19:00 -> Sat 12 Sep 21:00
+   Send report   CREATED     no window
+
+Open now:
+   Send report   OVERDUE     no window
+   DSA practice  SCHEDULED   Sun 13 Sep 10:00 -> Sun 13 Sep 12:00
+
+The engine woke 9 times in 23 hours (a once-a-minute poll: 1380).
+The decision-maker was woken 5 times, each for a window ending, a missed deadline or a new day, never to ask the time.

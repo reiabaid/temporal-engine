@@ -10,3 +10,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+# personal / machine-specific
+.mcp.json
+notes/

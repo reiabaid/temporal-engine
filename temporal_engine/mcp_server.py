@@ -105,15 +105,19 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
 
 
 def _task_summary(task: Task, now: datetime, tasks: Optional[dict[str, Task]] = None) -> dict[str, Any]:
+    def shown(dt: Optional[datetime]) -> Optional[str]:
+        # The same instant, written in the task's own timezone, so a task imported in UTC and one created locally read alike.
+        return dt.astimezone(ZoneInfo(task.display_timezone)).isoformat() if dt else None
+
     summary = {
         "id": task.id,
         "title": task.title,
         "status": task.status.value,
-        "scheduled_start": _iso(task.scheduled_start),
-        "scheduled_end": _iso(task.scheduled_end),
-        "deadline": _iso(task.deadline),
+        "scheduled_start": shown(task.scheduled_start),
+        "scheduled_end": shown(task.scheduled_end),
+        "deadline": shown(task.deadline),
         "carried_from": task.carried_from,
-        "actual_start": _iso(task.actual_start),
+        "actual_start": shown(task.actual_start),
     }
     if task.recurrence_id:
         summary["recurrence_id"] = task.recurrence_id

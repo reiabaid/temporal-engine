@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "temporal-engine": {
+      "command": "temporal-engine-mcp",
+      "env": {
+        "TEMPORAL_ENGINE_TZ": "America/New_York"
+      }
+    }
+  }
+}
