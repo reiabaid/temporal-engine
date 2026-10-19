@@ -215,4 +215,4 @@ PLAN.md             the original build plan (see the status note at its top)
 
 ## License
 
-No license has been chosen yet, so by default all rights are reserved. Add a `LICENSE` file before others reuse this.
+MIT. See [LICENSE](LICENSE).

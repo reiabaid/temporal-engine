@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "temporal-engine"
 version = "0.1.0"
 description = "Deterministic, model-agnostic temporal state for AI agents, served over MCP."
+license = {text = "MIT"}
 readme = "README.md"
 # 3.11 for datetime.fromisoformat's full ISO 8601 parsing. Developed and
 # tested on 3.12 only.
